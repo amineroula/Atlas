@@ -1,0 +1,5 @@
+add_library(AtlasDatabase src/Catalog.cpp)
+add_library(Atlas::Database ALIAS AtlasDatabase)
+target_include_directories(AtlasDatabase PUBLIC include)
+target_link_libraries(AtlasDatabase PUBLIC Atlas::Core PRIVATE SQLite::SQLite3)
+target_compile_features(AtlasDatabase PUBLIC cxx_std_20)

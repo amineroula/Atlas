@@ -1,0 +1,5 @@
+add_library(AtlasScanner src/Scanner.cpp)
+add_library(Atlas::Scanner ALIAS AtlasScanner)
+target_include_directories(AtlasScanner PUBLIC include)
+target_link_libraries(AtlasScanner PUBLIC Atlas::Core)
+target_compile_features(AtlasScanner PUBLIC cxx_std_20)
