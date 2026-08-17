@@ -26,11 +26,11 @@ AssetKind classifyAsset(const std::filesystem::path& path, bool isDirectory) {
   const auto in = [&extension](const auto& values) {
     return std::find(values.begin(), values.end(), extension) != values.end();
   };
-  static constexpr std::array images{".bmp", ".exr", ".gif", ".hdr", ".heic", ".jpeg", ".jpg", ".png", ".psd", ".tga", ".tif", ".tiff", ".webp"};
-  static constexpr std::array videos{".avi", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".webm"};
-  static constexpr std::array audio{".aac", ".flac", ".m4a", ".mp3", ".ogg", ".wav", ".wma"};
-  static constexpr std::array models{".3ds", ".abc", ".blend", ".fbx", ".gltf", ".glb", ".obj", ".ply", ".stl", ".usd", ".usda", ".usdc"};
-  static constexpr std::array archives{".7z", ".gz", ".rar", ".tar", ".zip"};
+  static constexpr std::array images{".arw", ".avif", ".bmp", ".cr2", ".cr3", ".dng", ".exr", ".gif", ".hdr", ".heic", ".heif", ".jpeg", ".jpg", ".jxl", ".nef", ".orf", ".png", ".psb", ".psd", ".raf", ".svg", ".tga", ".tif", ".tiff", ".webp"};
+  static constexpr std::array videos{".3gp", ".avi", ".braw", ".flv", ".m2ts", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".mts", ".mxf", ".ogv", ".r3d", ".webm", ".wmv"};
+  static constexpr std::array audio{".aac", ".aif", ".aiff", ".flac", ".m4a", ".mid", ".midi", ".mp3", ".ogg", ".opus", ".wav", ".wma"};
+  static constexpr std::array models{".3ds", ".3mf", ".abc", ".blend", ".c4d", ".dae", ".fbx", ".glb", ".gltf", ".hip", ".hiplc", ".iges", ".igs", ".lwo", ".ma", ".max", ".mb", ".obj", ".ply", ".step", ".stl", ".stp", ".usd", ".usda", ".usdc", ".usdz", ".vdb", ".x3d", ".zpr", ".ztl"};
+  static constexpr std::array archives{".7z", ".bz2", ".gz", ".rar", ".tar", ".tgz", ".xz", ".zip"};
   static constexpr std::array documents{".csv", ".doc", ".docx", ".json", ".md", ".pdf", ".rtf", ".txt", ".xml"};
   if (in(images)) return AssetKind::Image;
   if (in(videos)) return AssetKind::Video;

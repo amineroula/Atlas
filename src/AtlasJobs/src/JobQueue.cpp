@@ -22,6 +22,13 @@ JobQueue::JobQueue(std::size_t workers) {
 }
 
 JobQueue::~JobQueue() {
+  {
+    std::lock_guard lock(mutex_);
+    for (const auto& [id, job] : jobs_) {
+      (void)id;
+      job->stop.request_stop();
+    }
+  }
   for (auto& worker : workers_) worker.request_stop();
   ready_.notify_all();
 }

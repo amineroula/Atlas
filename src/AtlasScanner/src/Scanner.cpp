@@ -38,6 +38,7 @@ ScanSummary Scanner::scan(const std::filesystem::path& root, std::stop_token sto
       break;
     }
     const auto& entry = *iterator;
+    summary.currentPath = entry.path();
     if (scanOptions.maximumDepth && iterator.depth() >= static_cast<int>(*scanOptions.maximumDepth)) {
       iterator.disable_recursion_pending();
     }
@@ -96,6 +97,56 @@ ScanSummary Scanner::scan(const std::filesystem::path& root, std::stop_token sto
   }
   if (progress) progress(summary);
   return summary;
+}
+
+DirectoryScanResult Scanner::scanDirectory(const std::filesystem::path& directory,
+                                           std::stop_token stopToken,
+                                           bool includeHidden) const {
+  DirectoryScanResult result;
+  std::error_code error;
+  const auto options = std::filesystem::directory_options::skip_permission_denied;
+  std::filesystem::directory_iterator iterator(directory, options, error), end;
+  if (error) {
+    result.inaccessible = 1;
+    return result;
+  }
+  while (iterator != end && !stopToken.stop_requested()) {
+    const auto& entry = *iterator;
+#ifdef _WIN32
+    if (!includeHidden) {
+      const auto filename = entry.path().filename().wstring();
+      if (!filename.empty() && filename.front() == L'.') {
+        iterator.increment(error);
+        if (error) { ++result.inaccessible; error.clear(); }
+        continue;
+      }
+    }
+#else
+    if (!includeHidden && entry.path().filename().string().starts_with('.')) {
+      iterator.increment(error);
+      if (error) { ++result.inaccessible; error.clear(); }
+      continue;
+    }
+#endif
+    AssetMetadata metadata{.path = entry.path()};
+    metadata.isSymlink = entry.is_symlink(error);
+    if (error) { ++result.inaccessible; error.clear(); }
+    metadata.isDirectory = entry.is_directory(error);
+    if (error) {
+      ++result.inaccessible;
+      error.clear();
+    } else if (!metadata.isDirectory) {
+      metadata.sizeBytes = entry.file_size(error);
+      if (error) { ++result.inaccessible; metadata.sizeBytes = 0; error.clear(); }
+    }
+    const auto modified = entry.last_write_time(error);
+    if (!error) metadata.modifiedAt = toSystemTime(modified);
+    else { ++result.inaccessible; error.clear(); }
+    result.entries.push_back(std::move(metadata));
+    iterator.increment(error);
+    if (error) { ++result.inaccessible; error.clear(); }
+  }
+  return result;
 }
 
 }  // namespace atlas

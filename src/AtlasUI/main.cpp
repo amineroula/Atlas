@@ -32,13 +32,27 @@ int main(int argc, char* argv[]) {
   application.setStyle(QStyleFactory::create("Fusion"));
   application.setStyleSheet(R"css(
     QWidget { background: #17191d; color: #e7e9ed; font-size: 10pt; }
-    QLineEdit, QTreeView, QListView, QTreeWidget { background: #111318; border: 1px solid #30343c; }
-    QTreeView::item:selected, QListView::item:selected { background: #335d92; }
-    QToolBar { border: 0; spacing: 6px; padding: 6px; }
-    QDockWidget::title { background: #22262c; padding: 6px; }
-    QTabBar::tab { background: #22262c; padding: 8px 18px; }
-    QTabBar::tab:selected { background: #335d92; }
-    QStatusBar { color: #9da3ae; }
+    QMainWindow::separator { background: #2b3038; width: 4px; height: 4px; }
+    QLineEdit, QTreeView, QListView, QTreeWidget, QTableWidget {
+      background: #111318; border: 1px solid #303640; border-radius: 3px;
+    }
+    QLineEdit { padding: 6px 9px; selection-background-color: #3e74ad; }
+    QTreeView::item, QTreeWidget::item { min-height: 24px; padding: 2px; }
+    QTreeView::item:selected, QListView::item:selected, QTreeWidget::item:selected {
+      background: #315f91; color: white;
+    }
+    QToolBar { background: #1d2025; border: 0; spacing: 7px; padding: 7px; }
+    QToolButton, QPushButton {
+      background: #282d35; border: 1px solid #39414c; border-radius: 4px; padding: 6px 10px;
+    }
+    QToolButton:hover, QPushButton:hover { background: #343b46; border-color: #4c76a3; }
+    QToolButton:pressed, QPushButton:pressed { background: #294e76; }
+    QDockWidget::title { background: #23272e; padding: 8px; font-weight: 600; }
+    QTabBar::tab { background: #23272e; padding: 9px 20px; border-right: 1px solid #15171b; }
+    QTabBar::tab:selected { background: #315f91; color: white; }
+    QHeaderView::section { background: #252a31; border: 0; border-right: 1px solid #343a44; padding: 7px; }
+    QLabel#PanelHint { color: #89919d; font-size: 9pt; }
+    QStatusBar { color: #aab1bc; background: #1d2025; }
   )css");
   atlas::MainWindow window;
   window.show();

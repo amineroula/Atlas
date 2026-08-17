@@ -12,6 +12,29 @@
 namespace atlas {
 
 using AssetId = std::int64_t;
+using ScanSessionId = std::int64_t;
+
+enum class ScanSessionState { Pending, Running, Paused, Completed, Failed };
+
+struct ScanSession {
+  ScanSessionId id{};
+  std::string name;
+  std::filesystem::path root;
+  bool driveScan{};
+  bool snapshot{};
+  std::optional<ScanSessionId> sourceSessionId;
+  std::uint32_t dataVersion{1};
+  std::uint32_t organizationVersion{};
+  ScanSessionState state{ScanSessionState::Pending};
+  std::uint64_t files{};
+  std::uint64_t directories{};
+  std::uint64_t bytes{};
+  std::uint64_t inaccessible{};
+  std::uint64_t pendingDirectories{};
+  std::chrono::system_clock::time_point startedAt{};
+  std::chrono::system_clock::time_point updatedAt{};
+  std::string error;
+};
 
 struct CatalogAsset {
   AssetId id{};
@@ -58,6 +81,23 @@ class Catalog {
   void addBookmark(const std::filesystem::path& path);
   void removeBookmark(const std::filesystem::path& path);
   [[nodiscard]] std::vector<std::filesystem::path> bookmarks() const;
+
+  ScanSessionId createScanSession(const std::filesystem::path& root, bool driveScan);
+  ScanSessionId saveScanSnapshot(ScanSessionId sourceId, std::string name);
+  [[nodiscard]] std::optional<ScanSession> scanSession(ScanSessionId id) const;
+  [[nodiscard]] std::vector<ScanSession> scanSessions() const;
+  void setScanSessionState(ScanSessionId id, ScanSessionState state,
+                           std::string error = {});
+  void setScanOrganizationVersion(ScanSessionId id, std::uint32_t version);
+  [[nodiscard]] std::optional<std::filesystem::path> nextScanDirectory(
+      ScanSessionId id) const;
+  void recordScannedDirectory(ScanSessionId id, const std::filesystem::path& directory,
+                              const std::vector<AssetMetadata>& entries,
+                              std::uint64_t inaccessible = 0);
+  [[nodiscard]] std::vector<CatalogAsset> scanAssets(ScanSessionId id,
+                                                     std::size_t limit = 10000) const;
+  [[nodiscard]] std::vector<CatalogAsset> scanPbrTextureAssets(
+      ScanSessionId id, std::size_t limit = 100000) const;
 
  private:
   struct Impl;

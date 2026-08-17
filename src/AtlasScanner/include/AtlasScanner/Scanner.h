@@ -7,6 +7,7 @@
 #include <functional>
 #include <optional>
 #include <stop_token>
+#include <vector>
 
 namespace atlas {
 
@@ -15,6 +16,7 @@ struct ScanSummary {
   std::uint64_t directories{};
   std::uint64_t bytes{};
   std::uint64_t inaccessible{};
+  std::filesystem::path currentPath;
   bool cancelled{};
 };
 
@@ -28,6 +30,11 @@ struct ScanOptions {
   std::uint64_t progressInterval{250};
 };
 
+struct DirectoryScanResult {
+  std::vector<AssetMetadata> entries;
+  std::uint64_t inaccessible{};
+};
+
 class Scanner {
  public:
   [[nodiscard]] ScanSummary scan(const std::filesystem::path& root,
@@ -35,6 +42,9 @@ class Scanner {
                                  const AssetDiscovered& discovered,
                                  const ScanOptions& options = {},
                                  const ScanProgress& progress = {}) const;
+  [[nodiscard]] DirectoryScanResult scanDirectory(
+      const std::filesystem::path& directory, std::stop_token stopToken = {},
+      bool includeHidden = true) const;
 };
 
 }  // namespace atlas

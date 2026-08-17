@@ -1,10 +1,12 @@
 #include <AtlasDatabase/Catalog.h>
 #include <AtlasCore/FileOperations.h>
+#include <AtlasCore/PbrMaterial.h>
 #include <AtlasCore/StorageAnalyzer.h>
 #include <AtlasJobs/JobQueue.h>
 #include <AtlasScanner/Scanner.h>
 
 #include <chrono>
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -123,6 +125,85 @@ void scannerHonorsDepth() {
   require(summary.files == 0, "depth-limited scanner recursed too far");
 }
 
+void persistentScanCanStopAndResume() {
+  TemporaryDirectory temporary;
+  const auto root = temporary.path() / "library";
+  std::filesystem::create_directories(root / "materials");
+  std::ofstream(root / "hero.fbx") << "model";
+  std::ofstream(root / "materials" / "stone_albedo.png") << "color";
+  std::ofstream(root / "materials" / "stone_normal.png") << "normal";
+
+  const auto database = temporary.path() / "catalog.db";
+  atlas::ScanSessionId sessionId{};
+  atlas::ScanSessionId snapshotId{};
+  {
+    atlas::Catalog catalog(database);
+    sessionId = catalog.createScanSession(root, false);
+    catalog.setScanSessionState(sessionId, atlas::ScanSessionState::Running);
+    const auto pending = catalog.nextScanDirectory(sessionId);
+    require(pending && atlas::normalizedPath(*pending) == atlas::normalizedPath(root),
+            "persistent scan did not queue its root");
+    const auto directory = atlas::Scanner{}.scanDirectory(*pending);
+    catalog.recordScannedDirectory(sessionId, *pending, directory.entries,
+                                   directory.inaccessible);
+    catalog.setScanSessionState(sessionId, atlas::ScanSessionState::Paused);
+    const auto paused = catalog.scanSession(sessionId);
+    require(paused && paused->state == atlas::ScanSessionState::Paused,
+            "paused scan state was not saved");
+    require(paused->files == 1 && paused->directories == 1 &&
+                paused->pendingDirectories == 1,
+            "partial scan totals or checkpoint are incorrect");
+    snapshotId = catalog.saveScanSnapshot(sessionId, "Library checkpoint");
+    const auto snapshot = catalog.scanSession(snapshotId);
+    require(snapshot && snapshot->snapshot && snapshot->name == "Library checkpoint" &&
+                snapshot->sourceSessionId == sessionId && snapshot->files == 1 &&
+                snapshot->directories == 1 && snapshot->pendingDirectories == 0,
+            "Save scan as did not create an immutable named snapshot");
+  }
+  {
+    atlas::Catalog catalog(database);
+    const auto restored = catalog.scanSession(sessionId);
+    require(restored && restored->state == atlas::ScanSessionState::Paused,
+            "scan session did not survive catalog reopen");
+    catalog.setScanSessionState(sessionId, atlas::ScanSessionState::Running);
+    const auto pending = catalog.nextScanDirectory(sessionId);
+    require(pending && pending->filename() == "materials",
+            "scan did not resume at the pending directory");
+    const auto directory = atlas::Scanner{}.scanDirectory(*pending);
+    catalog.recordScannedDirectory(sessionId, *pending, directory.entries,
+                                   directory.inaccessible);
+    require(!catalog.nextScanDirectory(sessionId), "completed scan retained pending work");
+    catalog.setScanSessionState(sessionId, atlas::ScanSessionState::Completed);
+    const auto complete = catalog.scanSession(sessionId);
+    require(complete && complete->files == 3 && complete->directories == 1 &&
+                complete->pendingDirectories == 0,
+            "resumed scan totals are incorrect");
+    const auto assets = catalog.scanAssets(sessionId);
+    require(assets.size() == 4, "saved scan did not retain every discovered asset");
+    require(assets.front().metadata.path.filename() == "stone_albedo.png",
+            "organized scan results did not prioritize PBR textures");
+    const auto snapshotAssets = catalog.scanAssets(snapshotId);
+    require(snapshotAssets.size() == 2,
+            "saved scan snapshot changed when its source scan resumed");
+    atlas::AssetMetadata changedHero{
+        .path = root / "hero.fbx",
+        .sizeBytes = 999,
+        .modifiedAt = std::chrono::system_clock::now()};
+    catalog.upsert(changedHero);
+    const auto frozenSnapshotAssets = catalog.scanAssets(snapshotId);
+    const auto frozenHero = std::find_if(frozenSnapshotAssets.begin(), frozenSnapshotAssets.end(),
+        [](const auto& asset) { return asset.metadata.path.filename() == "hero.fbx"; });
+    require(frozenHero != frozenSnapshotAssets.end() && frozenHero->metadata.sizeBytes == 5,
+            "saved scan snapshot metadata changed with the live catalog");
+    catalog.setScanOrganizationVersion(snapshotId, atlas::PbrOrganizerVersion);
+    const auto reorganized = catalog.scanSession(snapshotId);
+    require(reorganized &&
+                reorganized->organizationVersion == atlas::PbrOrganizerVersion &&
+                reorganized->dataVersion == 1,
+            "saved scan did not record independent data and organizer versions");
+  }
+}
+
 void fileOperationsAreConflictAware() {
   TemporaryDirectory temporary;
   const auto sourceDirectory = temporary.path() / "source";
@@ -144,6 +225,13 @@ void fileOperationsAreConflictAware() {
   const auto renamed = sourceDirectory / "renamed.txt";
   atlas::FileOperations::rename(source, renamed);
   require(std::filesystem::exists(renamed), "rename operation failed");
+  const auto moveSource = sourceDirectory / "move.txt";
+  std::ofstream(moveSource) << "move me";
+  result = atlas::FileOperations::transfer(atlas::FileOperationKind::Move, {moveSource},
+      targetDirectory, atlas::ConflictPolicy::Skip);
+  require(result.succeeded == 1 && !std::filesystem::exists(moveSource) &&
+              std::filesystem::exists(targetDirectory / "move.txt"),
+          "move operation failed");
 }
 
 void jobQueueRunsAndCancelsWork() {
@@ -166,11 +254,33 @@ void jobQueueRunsAndCancelsWork() {
           "cancelled job has wrong state");
 }
 
+void jobQueueShutdownCancelsRunningWork() {
+  std::atomic<bool> started{};
+  std::atomic<bool> stopped{};
+  {
+    atlas::JobQueue queue(1);
+    queue.submit("shutdown", [&started, &stopped](std::stop_token token,
+                                                   const atlas::JobReporter&) {
+      started = true;
+      while (!token.stop_requested()) std::this_thread::yield();
+      stopped = true;
+    });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!started && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+    require(started, "shutdown test job did not start");
+  }
+  require(stopped, "job queue shutdown did not cancel running work");
+}
+
 void assetKindsAreRecognized() {
   require(atlas::classifyAsset("texture.EXR") == atlas::AssetKind::Image,
           "image classification is not case insensitive");
   require(atlas::classifyAsset("mesh.fbx") == atlas::AssetKind::Model,
           "model classification failed");
+  require(atlas::classifyAsset("scene.MAX") == atlas::AssetKind::Model,
+          "DCC model classification failed");
+  require(atlas::classifyAsset("render.mov") == atlas::AssetKind::Video,
+          "video classification failed");
   require(atlas::classifyAsset("folder", true) == atlas::AssetKind::Directory,
           "directory classification failed");
 }
@@ -182,13 +292,91 @@ void storageAnalysisFindsWaste() {
   std::ofstream(temporary.path() / "assets" / "first.bin") << "duplicate content";
   std::ofstream(temporary.path() / "assets" / "second.bin") << "duplicate content";
   std::ofstream(temporary.path() / "assets" / "unique.bin") << "unique";
+  std::ofstream(temporary.path() / "assets" / "preview.png") << "image";
+  std::ofstream(temporary.path() / "assets" / "mesh.fbx") << "model";
+  std::ofstream(temporary.path() / "assets" / "clip.mp4") << "video";
   const auto analysis = atlas::StorageAnalyzer{}.analyze(temporary.path());
-  require(analysis.files == 3, "storage analyzer file count is incorrect");
+  require(analysis.files == 6, "storage analyzer file count is incorrect");
   require(!analysis.emptyFolders.empty(), "storage analyzer missed an empty folder");
+  require(analysis.emptyFolderCount == 1, "storage analyzer empty-folder count is incorrect");
   require(analysis.duplicates.size() == 1 && analysis.duplicates.front().paths.size() == 2,
           "storage analyzer missed exact duplicates");
   require(!analysis.largestFiles.empty() && !analysis.largestFolders.empty(),
           "storage analyzer did not rank paths");
+  require(analysis.assetTypes.images == 1 && analysis.assetTypes.models == 1 &&
+              analysis.assetTypes.videos == 1 && analysis.assetTypes.other == 3,
+          "storage analyzer media breakdown is incorrect");
+}
+
+void storageAnalysisFindsPbrMaterialsAndFormats() {
+  TemporaryDirectory temporary;
+  const auto material = temporary.path() / "Oak Floor";
+  std::filesystem::create_directories(material);
+  std::ofstream(material / "oak_base_color_4k.png") << "base color";
+  std::ofstream(material / "oak_normal_gl_4k.png") << "normal";
+  std::ofstream(material / "oak_roughness_4k.png") << "roughness";
+  std::ofstream(material / "oak_metallic_4k.png") << "metallic";
+  std::ofstream(temporary.path() / "chair.FBX") << "model";
+  std::ofstream(temporary.path() / "textures.zip") << "archive";
+  std::ofstream(temporary.path() / "backup.7z") << "backup";
+
+  const auto analysis = atlas::StorageAnalyzer{}.analyze(temporary.path(), {}, 25, false);
+  require(analysis.pbrMaterials.size() == 1, "PBR material grouping is incorrect");
+  require(analysis.pbrMaterials.front().textures.size() == 4,
+          "PBR material maps were not grouped together");
+  require(analysis.pbrMaterials.front().hasCoreMaps,
+          "complete PBR material was not recognized");
+  require(analysis.fbxFiles.size() == 1, "FBX inventory is incorrect");
+  require(analysis.archiveFiles.size() == 2, "archive inventory is incorrect");
+  const auto png = std::find_if(analysis.fileTypes.begin(), analysis.fileTypes.end(),
+      [](const auto& type) { return type.extension == ".png"; });
+  require(png != analysis.fileTypes.end() && png->files == 4,
+          "extension diagnostics are incorrect");
+  require(analysis.assetBytes.images > 0 && analysis.assetBytes.models > 0 &&
+              analysis.assetBytes.archives > 0,
+          "category byte totals are incorrect");
+}
+
+void pbrNamesGroupCollectionFoldersConservatively() {
+  const auto barkDiffuse = atlas::identifyPbrTexture("bark4x1_01_diffuse2.jpg");
+  const auto barkGloss = atlas::identifyPbrTexture("bark4x1_01_glossiness.jpg");
+  const auto barkNormal = atlas::identifyPbrTexture("bark4x1_01_normal.jpg");
+  const auto barkSpecular = atlas::identifyPbrTexture("bark4x1_01_specular.jpg");
+  require(barkDiffuse && barkGloss && barkNormal && barkSpecular,
+          "legacy PBR maps were not recognized");
+  require(barkDiffuse->canonicalMaterialKey == "bark4x1_01" &&
+              barkGloss->canonicalMaterialKey == barkDiffuse->canonicalMaterialKey &&
+              barkNormal->canonicalMaterialKey == barkDiffuse->canonicalMaterialKey &&
+              barkSpecular->canonicalMaterialKey == barkDiffuse->canonicalMaterialKey,
+          "maps in a collection folder were not grouped by filename identity");
+  const std::set<atlas::PbrMapKind> barkMaps{
+      barkDiffuse->kind, barkGloss->kind, barkNormal->kind, barkSpecular->kind};
+  require(atlas::classifyPbrWorkflow(barkMaps) == atlas::PbrWorkflow::SpecularGlossiness,
+          "legacy specular/glossiness material was not considered complete");
+
+  const auto broccoliNormal = atlas::identifyPbrTexture(
+      "brocolis_24k_DefaultMaterial_Normal.jpg");
+  const auto broccoliHeight = atlas::identifyPbrTexture("brocolis_24k_n_height.png");
+  require(broccoliNormal && broccoliHeight &&
+              broccoliNormal->canonicalMaterialKey == "brocolis" &&
+              broccoliHeight->canonicalMaterialKey == "brocolis",
+          "resolution and generic exporter tokens split one material identity");
+
+  const auto leafVariant = atlas::identifyPbrTexture("leaf1_diffuse4.jpg");
+  const auto leafNormal = atlas::identifyPbrTexture("leaf1_normal3.jpg");
+  require(leafVariant && leafNormal && leafVariant->canonicalMaterialKey == "leaf1" &&
+              leafNormal->canonicalMaterialKey == "leaf1",
+          "numbered map variants split one material identity");
+  require(leafVariant->mapVariant == "4" && leafNormal->mapVariant == "3",
+          "numbered map variants were not retained for evidence-based sub-grouping");
+  const auto cauliflower = atlas::identifyPbrTexture("cauliflower_normal.jpg");
+  const auto cauliflowerLeaf = atlas::identifyPbrTexture("cauliflower_leaf_albedo2.jpg");
+  require(cauliflower && cauliflowerLeaf &&
+              cauliflower->canonicalMaterialKey != cauliflowerLeaf->canonicalMaterialKey,
+          "distinct material parts were merged too aggressively");
+  const auto generic = atlas::identifyPbrTexture("DefaultMaterial_thickness.jpg");
+  require(generic && generic->canonicalMaterialKey.empty(),
+          "generic orphan map was incorrectly assigned a material identity");
 }
 
 }  // namespace
@@ -200,10 +388,14 @@ int main() {
     scannerReportsContents();
     scannerHonorsCancellation();
     scannerHonorsDepth();
+    persistentScanCanStopAndResume();
     fileOperationsAreConflictAware();
     jobQueueRunsAndCancelsWork();
+    jobQueueShutdownCancelsRunningWork();
     assetKindsAreRecognized();
     storageAnalysisFindsWaste();
+    storageAnalysisFindsPbrMaterialsAndFormats();
+    pbrNamesGroupCollectionFoldersConservatively();
     std::cout << "All Atlas foundation tests passed\n";
     return 0;
   } catch (const std::exception& error) {
