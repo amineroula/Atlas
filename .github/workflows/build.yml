@@ -31,7 +31,17 @@ jobs:
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-ninja
             mingw-w64-x86_64-qt6-base
+            mingw-w64-x86_64-qt6-svg
+            mingw-w64-x86_64-qt6-tools
             mingw-w64-x86_64-sqlite3
       - run: cmake -S . -B build -G Ninja -DBUILD_TESTING=ON -DATLAS_BUILD_DESKTOP=ON -DCMAKE_BUILD_TYPE=Release
       - run: cmake --build build --parallel 2
       - run: ctest --test-dir build --output-on-failure
+      - run: |
+          mkdir -p dist/Atlas-portable
+          cp build/src/AtlasUI/atlas.exe dist/Atlas-portable/
+          windeployqt6.exe --release --no-translations --no-system-d3d-compiler --no-opengl-sw dist/Atlas-portable/atlas.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: atlas-windows-portable
+          path: dist/Atlas-portable
