@@ -587,8 +587,16 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent), jobs_{} {
 
 MainWindow::~MainWindow() = default;
 
+std::filesystem::path MainWindow::defaultCatalogDirectory() const {
+  return std::filesystem::path(
+      QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation).toStdWString());
+}
+
 std::filesystem::path MainWindow::catalogPath() const {
-  return std::filesystem::path(QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation).toStdWString()) / L"atlas.db";
+  QSettings settings;
+  const auto stored = settings.value("storage/catalogRoot").toString();
+  if (stored.isEmpty()) return defaultCatalogDirectory() / L"atlas.db";
+  return std::filesystem::path(stored.toStdWString()) / L"atlas.db";
 }
 
 QString MainWindow::systemCacheFolder() const {
@@ -651,6 +659,86 @@ void MainWindow::applyCacheFolder(const QString& path) {
   statusBar()->showMessage("Default cache folder: " + QDir::toNativeSeparators(cacheRoot_),
                            7000);
   qInfo().noquote() << "Cache root" << cacheRoot_;
+}
+
+void MainWindow::chooseCatalogFolder() {
+  const auto currentDirectory =
+      QString::fromStdWString(catalogPath().parent_path().wstring());
+  const auto selected = QFileDialog::getExistingDirectory(
+      this, "Choose Atlas library folder", currentDirectory, QFileDialog::ShowDirsOnly);
+  if (selected.isEmpty()) return;
+  moveCatalogTo(QDir(selected).absolutePath());
+}
+
+void MainWindow::resetCatalogFolder() {
+  moveCatalogTo(QString::fromStdWString(defaultCatalogDirectory().wstring()));
+}
+
+void MainWindow::moveCatalogTo(const QString& directory) {
+  for (const auto& snapshot : jobs_.snapshots()) {
+    if (snapshot.state == JobState::Running) {
+      QMessageBox::warning(this, "Background jobs running",
+                           "Stop or wait for background jobs to finish before moving the "
+                           "Atlas library.");
+      return;
+    }
+  }
+
+  const auto normalized = QDir::cleanPath(QDir(directory).absolutePath());
+  const auto newDirectory = std::filesystem::path(normalized.toStdWString());
+  const auto newPath = newDirectory / L"atlas.db";
+  const auto oldPath = catalogPath();
+  if (newPath == oldPath) return;
+
+  std::error_code error;
+  std::filesystem::create_directories(newDirectory, error);
+  QTemporaryFile writeProbe(QDir(normalized).filePath(".atlas-write-test-XXXXXX"));
+  if (error || !writeProbe.open()) {
+    QMessageBox::critical(this, "Library folder unavailable",
+                          "Atlas cannot write to this folder:\n\n" +
+                              QDir::toNativeSeparators(normalized));
+    return;
+  }
+  writeProbe.close();
+  writeProbe.remove();
+
+  catalog_.reset();
+
+  const std::filesystem::path suffixes[] = {L"", L"-wal", L"-shm"};
+  for (const auto& suffix : suffixes) {
+    auto source = oldPath;
+    source += suffix;
+    if (!std::filesystem::exists(source, error)) continue;
+    auto destination = newPath;
+    destination += suffix;
+    std::filesystem::copy_file(source, destination,
+                               std::filesystem::copy_options::overwrite_existing, error);
+    if (error) {
+      QMessageBox::critical(this, "Library move failed",
+                            "Atlas could not copy the library database to the new folder:\n\n" +
+                                QDir::toNativeSeparators(normalized) + "\n\n" +
+                                QString::fromStdString(error.message()));
+      catalog_ = std::make_unique<Catalog>(oldPath);
+      return;
+    }
+  }
+  for (const auto& suffix : suffixes) {
+    auto source = oldPath;
+    source += suffix;
+    std::filesystem::remove(source, error);
+    error.clear();
+  }
+
+  QSettings settings;
+  settings.setValue("storage/catalogRoot", normalized);
+  settings.sync();
+
+  catalog_ = std::make_unique<Catalog>(newPath);
+  refreshBookmarks();
+  refreshScanSessions();
+  statusBar()->showMessage("Atlas library moved to: " + QDir::toNativeSeparators(normalized),
+                           7000);
+  qInfo().noquote() << "Catalog root" << normalized;
 }
 
 BrowserTab* MainWindow::currentTab() const {
@@ -772,6 +860,19 @@ void MainWindow::createMenusAndToolbars() {
   settingsMenu->addSeparator();
   connect(settingsMenu->addAction("Reset cache folder to system default"),
           &QAction::triggered, this, &MainWindow::resetCacheFolder);
+
+  settingsMenu->addSeparator();
+  auto* chooseCatalog = settingsMenu->addAction("Choose library (database) folder...");
+  chooseCatalog->setToolTip(
+      "Move the Atlas catalog database (scan history, bookmarks, PBR material index) to "
+      "another drive or folder");
+  connect(chooseCatalog, &QAction::triggered, this, &MainWindow::chooseCatalogFolder);
+  connect(settingsMenu->addAction("Open library folder"), &QAction::triggered, this, [this] {
+    QDesktopServices::openUrl(
+        QUrl::fromLocalFile(QString::fromStdWString(catalogPath().parent_path().wstring())));
+  });
+  connect(settingsMenu->addAction("Reset library folder to system default"),
+          &QAction::triggered, this, &MainWindow::resetCatalogFolder);
 
   auto* help = menuBar()->addMenu("Help");
   connect(help->addAction("Quick start"), &QAction::triggered, this, [this] {
@@ -1515,8 +1616,11 @@ void MainWindow::showOrganizedScan(std::int64_t sessionId) {
   for (const auto& asset : generalAssets) {
     if (displayedIds.insert(asset.id).second) assets.push_back(asset);
   }
+  const auto persistedMaterials = catalog_->organizeMaterials(sessionId);
   catalog_->setScanOrganizationVersion(sessionId, PbrOrganizerVersion);
   refreshScanSessions();
+  qInfo().noquote() << "Persisted" << persistedMaterials.size()
+                    << "material sets for scan session" << sessionId;
   auto* dialog = new QDialog(this);
   dialog->setAttribute(Qt::WA_DeleteOnClose);
   dialog->setWindowTitle("Organized saved scan");

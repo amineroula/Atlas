@@ -62,6 +62,18 @@ ScanSession readScanSession(sqlite3_stmt* statement) {
   return session;
 }
 
+constexpr auto modelExtensionFilter =
+    "(lower(a.path) GLOB '*.3ds' OR lower(a.path) GLOB '*.3mf' OR lower(a.path) GLOB '*.abc' "
+    "OR lower(a.path) GLOB '*.blend' OR lower(a.path) GLOB '*.c4d' OR lower(a.path) GLOB '*.dae' "
+    "OR lower(a.path) GLOB '*.fbx' OR lower(a.path) GLOB '*.glb' OR lower(a.path) GLOB '*.gltf' "
+    "OR lower(a.path) GLOB '*.hip' OR lower(a.path) GLOB '*.hiplc' OR lower(a.path) GLOB '*.iges' "
+    "OR lower(a.path) GLOB '*.igs' OR lower(a.path) GLOB '*.lwo' OR lower(a.path) GLOB '*.ma' "
+    "OR lower(a.path) GLOB '*.max' OR lower(a.path) GLOB '*.mb' OR lower(a.path) GLOB '*.obj' "
+    "OR lower(a.path) GLOB '*.ply' OR lower(a.path) GLOB '*.step' OR lower(a.path) GLOB '*.stl' "
+    "OR lower(a.path) GLOB '*.stp' OR lower(a.path) GLOB '*.usd' OR lower(a.path) GLOB '*.usda' "
+    "OR lower(a.path) GLOB '*.usdc' OR lower(a.path) GLOB '*.usdz' OR lower(a.path) GLOB '*.vdb' "
+    "OR lower(a.path) GLOB '*.x3d' OR lower(a.path) GLOB '*.zpr' OR lower(a.path) GLOB '*.ztl')";
+
 constexpr auto scanSessionColumns =
     "s.id,s.name,s.root,s.drive_scan,s.is_snapshot,s.source_session_id,"
     "s.data_version,s.organization_version,s.state,s.files,s.directories,s.bytes,s.inaccessible,"
@@ -177,6 +189,38 @@ Catalog::Catalog(const std::filesystem::path& databasePath) : impl_(std::make_un
     )sql";
     check(sqlite3_exec(impl_->database, snapshotMigration, nullptr, nullptr, nullptr),
           impl_->database, "migrate catalog to named scan snapshots");
+  }
+  if (version < 5) {
+    constexpr auto materialsMigration = R"sql(
+      CREATE TABLE IF NOT EXISTS materials (
+        id INTEGER PRIMARY KEY,
+        session_id INTEGER NOT NULL REFERENCES scan_sessions(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        directory TEXT NOT NULL,
+        workflow INTEGER NOT NULL,
+        updated_ms INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS materials_session_idx ON materials(session_id);
+      CREATE TABLE IF NOT EXISTS material_textures (
+        material_id INTEGER NOT NULL REFERENCES materials(id) ON DELETE CASCADE,
+        asset_id INTEGER NOT NULL,
+        path TEXT NOT NULL,
+        map_kind INTEGER NOT NULL,
+        PRIMARY KEY(material_id,asset_id)
+      );
+      CREATE INDEX IF NOT EXISTS material_textures_material_idx
+        ON material_textures(material_id);
+      CREATE TABLE IF NOT EXISTS material_models (
+        material_id INTEGER NOT NULL REFERENCES materials(id) ON DELETE CASCADE,
+        asset_id INTEGER NOT NULL,
+        path TEXT NOT NULL,
+        PRIMARY KEY(material_id,asset_id)
+      );
+      CREATE INDEX IF NOT EXISTS material_models_material_idx ON material_models(material_id);
+      PRAGMA user_version=5;
+    )sql";
+    check(sqlite3_exec(impl_->database, materialsMigration, nullptr, nullptr, nullptr),
+          impl_->database, "migrate catalog to persisted materials");
   }
 }
 
@@ -687,6 +731,178 @@ std::vector<CatalogAsset> Catalog::scanPbrTextureAssets(ScanSessionId id,
     result.push_back(std::move(asset));
   }
   check(step, impl_->database, "read saved PBR scan assets");
+  return result;
+}
+
+std::vector<CatalogAsset> Catalog::scanModelAssets(ScanSessionId id, std::size_t limit) const {
+  const auto session = scanSession(id);
+  if (!session) return {};
+  std::string sql = "SELECT a.";
+  sql += session->snapshot ? "asset_id" : "id";
+  sql += ",a.path,a.size_bytes,a.modified_ms,a.is_directory,a.is_symlink ";
+  sql += session->snapshot
+             ? "FROM scan_snapshot_assets a WHERE a.session_id=? AND a.is_directory=0 AND "
+             : "FROM scan_assets sa JOIN assets a ON a.id=sa.asset_id "
+               "WHERE sa.session_id=? AND a.is_directory=0 AND ";
+  sql += modelExtensionFilter;
+  sql += " ORDER BY a.path COLLATE NOCASE LIMIT ?";
+  Statement statement(impl_->database, sql.c_str());
+  check(sqlite3_bind_int64(statement.get(), 1, id), impl_->database, "bind model scan id");
+  check(sqlite3_bind_int64(statement.get(), 2, static_cast<sqlite3_int64>(limit)),
+        impl_->database, "bind model scan result limit");
+  std::vector<CatalogAsset> result;
+  int step{};
+  while ((step = sqlite3_step(statement.get())) == SQLITE_ROW) {
+    CatalogAsset asset;
+    asset.id = sqlite3_column_int64(statement.get(), 0);
+    asset.metadata.path = reinterpret_cast<const char*>(sqlite3_column_text(statement.get(), 1));
+    asset.metadata.sizeBytes = static_cast<std::uintmax_t>(sqlite3_column_int64(statement.get(), 2));
+    asset.metadata.modifiedAt = fromMilliseconds(sqlite3_column_int64(statement.get(), 3));
+    asset.metadata.isDirectory = sqlite3_column_int(statement.get(), 4) != 0;
+    asset.metadata.isSymlink = sqlite3_column_int(statement.get(), 5) != 0;
+    result.push_back(std::move(asset));
+  }
+  check(step, impl_->database, "read scan model assets");
+  return result;
+}
+
+std::vector<CatalogMaterial> Catalog::organizeMaterials(ScanSessionId id) {
+  constexpr std::size_t organizeLimit = 250000;
+  const auto textureAssets = scanPbrTextureAssets(id, organizeLimit);
+  const auto modelAssets = scanModelAssets(id, organizeLimit);
+
+  std::vector<MaterialTextureInput> textureInputs;
+  textureInputs.reserve(textureAssets.size());
+  for (const auto& asset : textureAssets) textureInputs.push_back({asset.id, asset.metadata.path});
+  std::vector<MaterialModelInput> modelInputs;
+  modelInputs.reserve(modelAssets.size());
+  for (const auto& asset : modelAssets) modelInputs.push_back({asset.id, asset.metadata.path});
+
+  const auto organized = atlas::organizeMaterials(textureInputs, modelInputs);
+
+  check(sqlite3_exec(impl_->database, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr),
+        impl_->database, "begin organize materials");
+  std::vector<CatalogMaterial> result;
+  try {
+    Statement clear(impl_->database, "DELETE FROM materials WHERE session_id=?");
+    check(sqlite3_bind_int64(clear.get(), 1, id), impl_->database, "bind clear materials");
+    check(sqlite3_step(clear.get()), impl_->database, "clear prior materials");
+
+    const auto now = milliseconds(std::chrono::system_clock::now());
+    Statement insertMaterial(impl_->database, R"sql(
+      INSERT INTO materials(session_id,name,directory,workflow,updated_ms) VALUES(?,?,?,?,?)
+    )sql");
+    Statement insertTexture(impl_->database, R"sql(
+      INSERT INTO material_textures(material_id,asset_id,path,map_kind) VALUES(?,?,?,?)
+    )sql");
+    Statement insertModel(impl_->database, R"sql(
+      INSERT INTO material_models(material_id,asset_id,path) VALUES(?,?,?)
+    )sql");
+    for (const auto& material : organized) {
+      sqlite3_reset(insertMaterial.get());
+      sqlite3_clear_bindings(insertMaterial.get());
+      const auto directory = normalizedPath(material.directory);
+      check(sqlite3_bind_int64(insertMaterial.get(), 1, id), impl_->database, "bind material session");
+      check(sqlite3_bind_text(insertMaterial.get(), 2, material.name.c_str(), -1, SQLITE_TRANSIENT),
+            impl_->database, "bind material name");
+      check(sqlite3_bind_text(insertMaterial.get(), 3, directory.c_str(), -1, SQLITE_TRANSIENT),
+            impl_->database, "bind material directory");
+      check(sqlite3_bind_int(insertMaterial.get(), 4, static_cast<int>(material.workflow)),
+            impl_->database, "bind material workflow");
+      check(sqlite3_bind_int64(insertMaterial.get(), 5, now), impl_->database, "bind material time");
+      check(sqlite3_step(insertMaterial.get()), impl_->database, "insert material");
+      const auto materialId = sqlite3_last_insert_rowid(impl_->database);
+
+      CatalogMaterial catalogMaterial;
+      catalogMaterial.id = materialId;
+      catalogMaterial.name = material.name;
+      catalogMaterial.directory = material.directory;
+      catalogMaterial.workflow = material.workflow;
+
+      for (const auto& texture : material.textures) {
+        sqlite3_reset(insertTexture.get());
+        sqlite3_clear_bindings(insertTexture.get());
+        const auto path = normalizedPath(texture.path);
+        check(sqlite3_bind_int64(insertTexture.get(), 1, materialId), impl_->database, "bind texture material");
+        check(sqlite3_bind_int64(insertTexture.get(), 2, texture.assetId), impl_->database, "bind texture asset");
+        check(sqlite3_bind_text(insertTexture.get(), 3, path.c_str(), -1, SQLITE_TRANSIENT),
+              impl_->database, "bind texture path");
+        check(sqlite3_bind_int(insertTexture.get(), 4, static_cast<int>(texture.kind)),
+              impl_->database, "bind texture kind");
+        check(sqlite3_step(insertTexture.get()), impl_->database, "insert material texture");
+        catalogMaterial.textures.push_back({texture.assetId, texture.path, texture.kind});
+      }
+      for (const auto& model : material.models) {
+        sqlite3_reset(insertModel.get());
+        sqlite3_clear_bindings(insertModel.get());
+        const auto path = normalizedPath(model.path);
+        check(sqlite3_bind_int64(insertModel.get(), 1, materialId), impl_->database, "bind model material");
+        check(sqlite3_bind_int64(insertModel.get(), 2, model.assetId), impl_->database, "bind model asset");
+        check(sqlite3_bind_text(insertModel.get(), 3, path.c_str(), -1, SQLITE_TRANSIENT),
+              impl_->database, "bind model path");
+        check(sqlite3_step(insertModel.get()), impl_->database, "insert material model");
+        catalogMaterial.models.push_back({model.assetId, model.path});
+      }
+      result.push_back(std::move(catalogMaterial));
+    }
+    check(sqlite3_exec(impl_->database, "COMMIT", nullptr, nullptr, nullptr),
+          impl_->database, "commit organize materials");
+  } catch (...) {
+    sqlite3_exec(impl_->database, "ROLLBACK", nullptr, nullptr, nullptr);
+    throw;
+  }
+  return result;
+}
+
+std::vector<CatalogMaterial> Catalog::materials(ScanSessionId id) const {
+  std::vector<CatalogMaterial> result;
+  Statement materialStatement(impl_->database, R"sql(
+    SELECT id,name,directory,workflow FROM materials WHERE session_id=?
+    ORDER BY name COLLATE NOCASE
+  )sql");
+  check(sqlite3_bind_int64(materialStatement.get(), 1, id), impl_->database, "bind materials session");
+  int step{};
+  while ((step = sqlite3_step(materialStatement.get())) == SQLITE_ROW) {
+    CatalogMaterial material;
+    material.id = sqlite3_column_int64(materialStatement.get(), 0);
+    material.name = reinterpret_cast<const char*>(sqlite3_column_text(materialStatement.get(), 1));
+    material.directory = reinterpret_cast<const char*>(sqlite3_column_text(materialStatement.get(), 2));
+    material.workflow = static_cast<PbrWorkflow>(sqlite3_column_int(materialStatement.get(), 3));
+    result.push_back(std::move(material));
+  }
+  check(step, impl_->database, "read materials");
+
+  Statement textureStatement(impl_->database, R"sql(
+    SELECT asset_id,path,map_kind FROM material_textures WHERE material_id=?
+    ORDER BY map_kind,path COLLATE NOCASE
+  )sql");
+  Statement modelStatement(impl_->database, R"sql(
+    SELECT asset_id,path FROM material_models WHERE material_id=? ORDER BY path COLLATE NOCASE
+  )sql");
+  for (auto& material : result) {
+    sqlite3_reset(textureStatement.get());
+    sqlite3_clear_bindings(textureStatement.get());
+    check(sqlite3_bind_int64(textureStatement.get(), 1, material.id), impl_->database, "bind material textures");
+    while ((step = sqlite3_step(textureStatement.get())) == SQLITE_ROW) {
+      CatalogMaterialTexture texture;
+      texture.assetId = sqlite3_column_int64(textureStatement.get(), 0);
+      texture.path = reinterpret_cast<const char*>(sqlite3_column_text(textureStatement.get(), 1));
+      texture.kind = static_cast<PbrMapKind>(sqlite3_column_int(textureStatement.get(), 2));
+      material.textures.push_back(std::move(texture));
+    }
+    check(step, impl_->database, "read material textures");
+
+    sqlite3_reset(modelStatement.get());
+    sqlite3_clear_bindings(modelStatement.get());
+    check(sqlite3_bind_int64(modelStatement.get(), 1, material.id), impl_->database, "bind material models");
+    while ((step = sqlite3_step(modelStatement.get())) == SQLITE_ROW) {
+      CatalogMaterialModel model;
+      model.assetId = sqlite3_column_int64(modelStatement.get(), 0);
+      model.path = reinterpret_cast<const char*>(sqlite3_column_text(modelStatement.get(), 1));
+      material.models.push_back(std::move(model));
+    }
+    check(step, impl_->database, "read material models");
+  }
   return result;
 }
 

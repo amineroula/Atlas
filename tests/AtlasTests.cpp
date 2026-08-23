@@ -204,6 +204,49 @@ void persistentScanCanStopAndResume() {
   }
 }
 
+void catalogOrganizesAndPersistsMaterials() {
+  TemporaryDirectory temporary;
+  const auto root = temporary.path() / "library";
+  const auto propsDirectory = root / "chair";
+  std::filesystem::create_directories(propsDirectory);
+  std::ofstream(propsDirectory / "chair_basecolor.png") << "color";
+  std::ofstream(propsDirectory / "chair_normal.png") << "normal";
+  std::ofstream(propsDirectory / "chair_roughness.png") << "roughness";
+  std::ofstream(propsDirectory / "chair.fbx") << "model";
+
+  const auto database = temporary.path() / "catalog.db";
+  atlas::ScanSessionId sessionId{};
+  {
+    atlas::Catalog catalog(database);
+    sessionId = catalog.createScanSession(root, false);
+    catalog.setScanSessionState(sessionId, atlas::ScanSessionState::Running);
+    while (const auto pending = catalog.nextScanDirectory(sessionId)) {
+      const auto directory = atlas::Scanner{}.scanDirectory(*pending);
+      catalog.recordScannedDirectory(sessionId, *pending, directory.entries,
+                                     directory.inaccessible);
+    }
+    catalog.setScanSessionState(sessionId, atlas::ScanSessionState::Completed);
+
+    const auto materials = catalog.organizeMaterials(sessionId);
+    require(materials.size() == 1, "expected one persisted material from the scan");
+    require(materials.front().textures.size() == 3,
+            "persisted material did not retain all of its texture maps");
+    require(materials.front().models.size() == 1,
+            "persisted material did not link its colocated model");
+    require(materials.front().workflow != atlas::PbrWorkflow::Incomplete,
+            "persisted material workflow classification is incorrect");
+  }
+  {
+    atlas::Catalog catalog(database);
+    const auto materials = catalog.materials(sessionId);
+    require(materials.size() == 1, "organized materials did not survive catalog reopen");
+    require(materials.front().textures.size() == 3 && materials.front().models.size() == 1,
+            "reopened catalog lost material texture/model links");
+    require(materials.front().models.front().path.filename() == "chair.fbx",
+            "reopened catalog lost the linked model's identity");
+  }
+}
+
 void fileOperationsAreConflictAware() {
   TemporaryDirectory temporary;
   const auto sourceDirectory = temporary.path() / "source";
@@ -379,6 +422,35 @@ void pbrNamesGroupCollectionFoldersConservatively() {
           "generic orphan map was incorrectly assigned a material identity");
 }
 
+void organizeMaterialsLinksModelsByNameAndByProximity() {
+  const std::filesystem::path chairDirectory = "props/chair";
+  const std::filesystem::path rockDirectory = "props/rock";
+  std::vector<atlas::MaterialTextureInput> textures{
+      {1, chairDirectory / "chair_basecolor.png"},
+      {2, chairDirectory / "chair_normal.png"},
+      {3, chairDirectory / "chair_roughness.png"},
+      {4, rockDirectory / "boulder_basecolor.png"},
+      {5, rockDirectory / "boulder_normal.png"},
+  };
+  std::vector<atlas::MaterialModelInput> models{
+      {10, chairDirectory / "chair.fbx"},
+      {11, rockDirectory / "rock_lod0.obj"},
+  };
+
+  const auto materials = atlas::organizeMaterials(textures, models);
+  require(materials.size() == 2, "expected two organized materials");
+
+  const auto* chairMaterial = &materials[0];
+  const auto* rockMaterial = &materials[1];
+  if (chairMaterial->textures.front().path.parent_path() != chairDirectory) {
+    std::swap(chairMaterial, rockMaterial);
+  }
+  require(chairMaterial->models.size() == 1 && chairMaterial->models.front().assetId == 10,
+          "model was not linked to its material by filename-token overlap");
+  require(rockMaterial->models.size() == 1 && rockMaterial->models.front().assetId == 11,
+          "sole model in a single-material folder was not linked by proximity");
+}
+
 }  // namespace
 
 int main() {
@@ -389,6 +461,7 @@ int main() {
     scannerHonorsCancellation();
     scannerHonorsDepth();
     persistentScanCanStopAndResume();
+    catalogOrganizesAndPersistsMaterials();
     fileOperationsAreConflictAware();
     jobQueueRunsAndCancelsWork();
     jobQueueShutdownCancelsRunningWork();
@@ -396,6 +469,7 @@ int main() {
     storageAnalysisFindsWaste();
     storageAnalysisFindsPbrMaterialsAndFormats();
     pbrNamesGroupCollectionFoldersConservatively();
+    organizeMaterialsLinksModelsByNameAndByProximity();
     std::cout << "All Atlas foundation tests passed\n";
     return 0;
   } catch (const std::exception& error) {

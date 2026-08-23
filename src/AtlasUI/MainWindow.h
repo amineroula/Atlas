@@ -82,6 +82,10 @@ class MainWindow final : public QMainWindow {
   void applyCacheFolder(const QString& path);
   [[nodiscard]] QString systemCacheFolder() const;
   std::filesystem::path catalogPath() const;
+  void chooseCatalogFolder();
+  void resetCatalogFolder();
+  void moveCatalogTo(const QString& directory);
+  [[nodiscard]] std::filesystem::path defaultCatalogDirectory() const;
 
   QFileSystemModel* model_{};
   QTabWidget* tabs_{};

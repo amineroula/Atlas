@@ -1,6 +1,7 @@
 #pragma once
 
 #include <AtlasCore/Asset.h>
+#include <AtlasCore/PbrMaterial.h>
 
 #include <cstdint>
 #include <filesystem>
@@ -13,6 +14,27 @@ namespace atlas {
 
 using AssetId = std::int64_t;
 using ScanSessionId = std::int64_t;
+using MaterialId = std::int64_t;
+
+struct CatalogMaterialTexture {
+  AssetId assetId{};
+  std::filesystem::path path;
+  PbrMapKind kind{};
+};
+
+struct CatalogMaterialModel {
+  AssetId assetId{};
+  std::filesystem::path path;
+};
+
+struct CatalogMaterial {
+  MaterialId id{};
+  std::string name;
+  std::filesystem::path directory;
+  PbrWorkflow workflow{};
+  std::vector<CatalogMaterialTexture> textures;
+  std::vector<CatalogMaterialModel> models;
+};
 
 enum class ScanSessionState { Pending, Running, Paused, Completed, Failed };
 
@@ -98,6 +120,14 @@ class Catalog {
                                                      std::size_t limit = 10000) const;
   [[nodiscard]] std::vector<CatalogAsset> scanPbrTextureAssets(
       ScanSessionId id, std::size_t limit = 100000) const;
+  [[nodiscard]] std::vector<CatalogAsset> scanModelAssets(
+      ScanSessionId id, std::size_t limit = 100000) const;
+
+  // Groups this scan's PBR textures into material sets, links 3D models found
+  // alongside them, and persists the result (replacing any prior organization for
+  // this session). Returns the persisted materials.
+  std::vector<CatalogMaterial> organizeMaterials(ScanSessionId id);
+  [[nodiscard]] std::vector<CatalogMaterial> materials(ScanSessionId id) const;
 
  private:
   struct Impl;

@@ -1,7 +1,10 @@
 #include <AtlasCore/PbrMaterial.h>
+#include <AtlasCore/Asset.h>
 
 #include <algorithm>
 #include <cctype>
+#include <map>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -14,14 +17,14 @@ std::string lower(std::string value) {
   return value;
 }
 
-std::vector<std::string> tokensFor(const std::filesystem::path& path) {
-  auto stem = lower(path.stem().string());
-  for (auto& character : stem) {
+std::vector<std::string> tokensFromString(std::string value) {
+  value = lower(std::move(value));
+  for (auto& character : value) {
     if (!std::isalnum(static_cast<unsigned char>(character))) character = ' ';
   }
   std::vector<std::string> tokens;
   std::string token;
-  for (const auto character : stem) {
+  for (const auto character : value) {
     if (character == ' ') {
       if (!token.empty()) tokens.push_back(std::move(token));
       token.clear();
@@ -31,6 +34,10 @@ std::vector<std::string> tokensFor(const std::filesystem::path& path) {
   }
   if (!token.empty()) tokens.push_back(std::move(token));
   return tokens;
+}
+
+std::vector<std::string> tokensFor(const std::filesystem::path& path) {
+  return tokensFromString(path.stem().string());
 }
 
 std::string withoutTrailingDigits(std::string value) {
@@ -190,6 +197,125 @@ const char* pbrWorkflowName(PbrWorkflow workflow) noexcept {
     case PbrWorkflow::Foliage: return "Complete - Foliage/Opacity";
   }
   return "Candidate / incomplete";
+}
+
+namespace {
+
+bool tokensOverlap(const std::vector<std::string>& left, const std::vector<std::string>& right) {
+  for (const auto& token : left) {
+    if (token.size() < 3) continue;
+    for (const auto& other : right) {
+      if (token == other) return true;
+    }
+  }
+  return false;
+}
+
+}  // namespace
+
+std::vector<OrganizedMaterial> organizeMaterials(
+    const std::vector<MaterialTextureInput>& textures,
+    const std::vector<MaterialModelInput>& models) {
+  struct Identified {
+    const MaterialTextureInput* texture;
+    PbrTextureIdentity identity;
+  };
+  std::vector<Identified> identified;
+  identified.reserve(textures.size());
+  for (const auto& texture : textures) {
+    if (auto identity = identifyPbrTexture(texture.path)) {
+      identified.push_back({&texture, std::move(*identity)});
+    }
+  }
+
+  // First pass: only split a material into named variants (e.g. "leaf1" vs "leaf5")
+  // when at least two distinct map roles corroborate that variant under this material.
+  std::map<std::string, std::map<std::string, std::set<std::string>>> variantEvidence;
+  for (const auto& entry : identified) {
+    if (entry.identity.canonicalMaterialKey.empty() || entry.identity.mapVariant.empty()) continue;
+    const auto baseKey = normalizedPath(entry.texture->path.parent_path()) + "|" +
+                         entry.identity.canonicalMaterialKey;
+    variantEvidence[baseKey][entry.identity.mapVariant].insert(
+        pbrMapKindName(entry.identity.kind));
+  }
+
+  struct Group {
+    std::string name;
+    std::filesystem::path directory;
+    std::vector<OrganizedTexture> textures;
+    std::set<PbrMapKind> kinds;
+  };
+  std::vector<std::string> order;
+  std::unordered_map<std::string, Group> groups;
+  for (const auto& entry : identified) {
+    const auto directory = entry.texture->path.parent_path();
+    const bool folderIdentity = entry.identity.canonicalMaterialKey.empty();
+    auto name = folderIdentity ? directory.filename().string() : entry.identity.materialName;
+    const auto baseKey = normalizedPath(directory) + "|" +
+                         (folderIdentity ? "@dedicated-folder" : entry.identity.canonicalMaterialKey);
+    const auto& variant = entry.identity.mapVariant;
+    const bool provenVariant =
+        !variant.empty() && variantEvidence[baseKey][variant].size() >= 2;
+    const auto key = provenVariant ? baseKey + "|variant:" + variant : baseKey;
+    if (provenVariant) name += " - variant " + variant;
+
+    auto [iterator, inserted] = groups.try_emplace(key);
+    if (inserted) {
+      iterator->second.name = name;
+      iterator->second.directory = directory;
+      order.push_back(key);
+    }
+    iterator->second.textures.push_back(
+        {entry.texture->assetId, entry.texture->path, entry.identity.kind});
+    iterator->second.kinds.insert(entry.identity.kind);
+  }
+
+  std::vector<OrganizedMaterial> materials;
+  std::unordered_map<std::string, std::vector<std::size_t>> materialsByDirectory;
+  for (const auto& key : order) {
+    auto& group = groups.at(key);
+    if (group.kinds.size() < 2) continue;
+    OrganizedMaterial material;
+    material.name = group.name;
+    material.directory = group.directory;
+    material.workflow = classifyPbrWorkflow(group.kinds);
+    material.textures = std::move(group.textures);
+    std::sort(material.textures.begin(), material.textures.end(),
+              [](const auto& left, const auto& right) {
+                if (left.kind != right.kind) return left.kind < right.kind;
+                return left.path < right.path;
+              });
+    materialsByDirectory[normalizedPath(group.directory)].push_back(materials.size());
+    materials.push_back(std::move(material));
+  }
+
+  std::unordered_map<std::string, std::vector<const MaterialModelInput*>> modelsByDirectory;
+  for (const auto& model : models) {
+    modelsByDirectory[normalizedPath(model.path.parent_path())].push_back(&model);
+  }
+
+  for (auto& [directory, modelPointers] : modelsByDirectory) {
+    const auto materialIndicesIt = materialsByDirectory.find(directory);
+    if (materialIndicesIt == materialsByDirectory.end()) continue;
+    const auto& materialIndices = materialIndicesIt->second;
+
+    if (materialIndices.size() == 1 && modelPointers.size() == 1) {
+      materials[materialIndices.front()].models.push_back(
+          {modelPointers.front()->assetId, modelPointers.front()->path});
+      continue;
+    }
+    for (const auto* model : modelPointers) {
+      const auto modelTokens = tokensFor(model->path);
+      for (const auto index : materialIndices) {
+        const auto materialTokens = tokensFromString(materials[index].name);
+        if (tokensOverlap(modelTokens, materialTokens)) {
+          materials[index].models.push_back({model->assetId, model->path});
+        }
+      }
+    }
+  }
+
+  return materials;
 }
 
 }  // namespace atlas
