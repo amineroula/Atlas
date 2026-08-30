@@ -26,6 +26,7 @@ namespace atlas {
 
 class BrowserTab;
 class Catalog;
+class MorphisPreviewClient;
 struct StorageAnalysis;
 
 class MainWindow final : public QMainWindow {
@@ -57,6 +58,8 @@ class MainWindow final : public QMainWindow {
   void saveSelectedScanAs();
   void showSelectedScanResults();
   void showOrganizedScan(std::int64_t sessionId);
+  void showLibrary(std::int64_t sessionId);
+  void showSelectedLibrary();
   void showStatistics();
   void showDriveStatistics();
   void analyzePath(const QString& path, const QString& title, bool findDuplicates);
@@ -86,6 +89,7 @@ class MainWindow final : public QMainWindow {
   void resetCatalogFolder();
   void moveCatalogTo(const QString& directory);
   [[nodiscard]] std::filesystem::path defaultCatalogDirectory() const;
+  void chooseMorphisExecutable();
 
   QFileSystemModel* model_{};
   QTabWidget* tabs_{};
@@ -121,6 +125,7 @@ class MainWindow final : public QMainWindow {
   QHash<JobId, QString> lastJobDetails_;
   QHash<std::int64_t, JobId> scanJobs_;
   QString cacheRoot_;
+  std::unique_ptr<MorphisPreviewClient> morphisClient_;
 };
 
 }  // namespace atlas

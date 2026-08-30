@@ -1,8 +1,10 @@
 #include "MainWindow.h"
+#include "MorphisPreviewClient.h"
 #include "ThumbnailCache.h"
 
 #include <AtlasCore/Asset.h>
 #include <AtlasCore/FileOperations.h>
+#include <AtlasCore/MorphisPreview.h>
 #include <AtlasCore/PbrMaterial.h>
 #include <AtlasCore/StorageAnalyzer.h>
 #include <AtlasDatabase/Catalog.h>
@@ -10,7 +12,10 @@
 
 #include <QAction>
 #include <QApplication>
+#include <QAudioOutput>
+#include <QCheckBox>
 #include <QCloseEvent>
+#include <QComboBox>
 #include <QDesktopServices>
 #include <QDate>
 #include <QDateTime>
@@ -26,6 +31,7 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFileSystemModel>
+#include <QFont>
 #include <QHeaderView>
 #include <QHBoxLayout>
 #include <QInputDialog>
@@ -36,12 +42,15 @@
 #include <QLocale>
 #include <QListView>
 #include <QListWidget>
+#include <QMediaPlayer>
 #include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QMouseEvent>
 #include <QMimeData>
 #include <QMimeDatabase>
+#include <QPainter>
+#include <QPen>
 #include <QProcess>
 #include <QPushButton>
 #include <QPointer>
@@ -49,7 +58,9 @@
 #include <QPixmap>
 #include <QRegularExpression>
 #include <QProgressBar>
+#include <QScrollArea>
 #include <QSettings>
+#include <QSignalBlocker>
 #include <QSortFilterProxyModel>
 #include <QSet>
 #include <QSlider>
@@ -62,12 +73,14 @@
 #include <QTableWidget>
 #include <QTemporaryFile>
 #include <QToolBar>
+#include <QToolButton>
 #include <QTreeView>
 #include <QTreeWidget>
 #include <QThreadPool>
 #include <QTime>
 #include <QUrl>
 #include <QVBoxLayout>
+#include <QVideoWidget>
 
 #include <algorithm>
 #include <atomic>
@@ -90,7 +103,166 @@ QString scanSessionStateName(ScanSessionState state) {
   return "Unknown";
 }
 
+enum class LibraryCategory { Material, Model, Image, Video, Audio, Document, Archive, Other };
+
+constexpr LibraryCategory libraryCategories[] = {
+    LibraryCategory::Material, LibraryCategory::Model, LibraryCategory::Image,
+    LibraryCategory::Video,    LibraryCategory::Audio, LibraryCategory::Document,
+    LibraryCategory::Archive,  LibraryCategory::Other};
+
+struct LibraryItem {
+  QString name;
+  QString path;
+  LibraryCategory category{};
+  qint64 sizeBytes{};
+  qint64 modifiedMs{};
+  MaterialId materialId{-1};
+  PbrWorkflow workflow{PbrWorkflow::Incomplete};
+  QStringList materialRoles;
+  QStringList linkedModels;
+  QString previewImagePath;
+  std::shared_ptr<CatalogMaterial> sourceMaterial;
+};
+
+QString libraryCategoryLabel(LibraryCategory category) {
+  switch (category) {
+    case LibraryCategory::Material: return "PBR Materials";
+    case LibraryCategory::Model: return "3D Models";
+    case LibraryCategory::Image: return "Images";
+    case LibraryCategory::Video: return "Video";
+    case LibraryCategory::Audio: return "Audio";
+    case LibraryCategory::Document: return "Documents";
+    case LibraryCategory::Archive: return "Archives";
+    case LibraryCategory::Other: return "Other";
+  }
+  return "Other";
+}
+
+LibraryCategory libraryCategoryFor(AssetKind kind) {
+  switch (kind) {
+    case AssetKind::Model: return LibraryCategory::Model;
+    case AssetKind::Image: return LibraryCategory::Image;
+    case AssetKind::Video: return LibraryCategory::Video;
+    case AssetKind::Audio: return LibraryCategory::Audio;
+    case AssetKind::Document: return LibraryCategory::Document;
+    case AssetKind::Archive: return LibraryCategory::Archive;
+    case AssetKind::Other:
+    case AssetKind::Directory:
+      return LibraryCategory::Other;
+  }
+  return LibraryCategory::Other;
+}
+
+QIcon libraryCategoryIcon(LibraryCategory category) {
+  static QHash<int, QIcon> cache;
+  const auto key = static_cast<int>(category);
+  const auto cached = cache.constFind(key);
+  if (cached != cache.constEnd()) return *cached;
+
+  QColor color;
+  QString glyph;
+  switch (category) {
+    case LibraryCategory::Material: color = QColor("#e2b66d"); glyph = QString::fromUtf8("\xe2\x97\x89"); break;
+    case LibraryCategory::Model: color = QColor("#7fb3e0"); glyph = QString::fromUtf8("\xe2\x96\xb2"); break;
+    case LibraryCategory::Image: color = QColor("#78d89a"); glyph = QString::fromUtf8("\xe2\x96\xa3"); break;
+    case LibraryCategory::Video: color = QColor("#e07f9a"); glyph = QString::fromUtf8("\xe2\x96\xb6"); break;
+    case LibraryCategory::Audio: color = QColor("#c78af0"); glyph = QString::fromUtf8("\xe2\x99\xab"); break;
+    case LibraryCategory::Document: color = QColor("#9aa4b2"); glyph = QString::fromUtf8("\xe2\x89\xa1"); break;
+    case LibraryCategory::Archive: color = QColor("#e0a95c"); glyph = "z"; break;
+    case LibraryCategory::Other: color = QColor("#8991a0"); glyph = "?"; break;
+  }
+  QPixmap pixmap(96, 96);
+  pixmap.fill(Qt::transparent);
+  QPainter painter(&pixmap);
+  painter.setRenderHint(QPainter::Antialiasing);
+  painter.setBrush(QColor(color.red() / 4, color.green() / 4, color.blue() / 4));
+  painter.setPen(QPen(color, 2));
+  painter.drawRoundedRect(4, 4, 88, 88, 14, 14);
+  QFont font = painter.font();
+  font.setPixelSize(40);
+  painter.setFont(font);
+  painter.setPen(color);
+  painter.drawText(pixmap.rect(), Qt::AlignCenter, glyph);
+  painter.end();
+
+  QIcon icon(pixmap);
+  cache.insert(key, icon);
+  return icon;
+}
+
+MorphisPreviewRequest buildMorphisPreviewRequest(
+    const CatalogMaterial& material, MorphisPreviewGeometry geometry,
+    std::optional<std::filesystem::path> model = std::nullopt) {
+  MorphisPreviewRequest request;
+  request.materialName = material.name;
+  request.workflow = material.workflow;
+  for (const auto& texture : material.textures) {
+    switch (texture.kind) {
+      case PbrMapKind::BaseColor: request.maps.baseColor = texture.path; break;
+      case PbrMapKind::Normal: request.maps.normal = texture.path; break;
+      case PbrMapKind::Roughness: request.maps.roughness = texture.path; break;
+      case PbrMapKind::Glossiness: request.maps.glossiness = texture.path; break;
+      case PbrMapKind::Metallic: request.maps.metallic = texture.path; break;
+      case PbrMapKind::AmbientOcclusion: request.maps.ambientOcclusion = texture.path; break;
+      case PbrMapKind::Height: request.maps.height = texture.path; break;
+      case PbrMapKind::Opacity: request.maps.opacity = texture.path; break;
+      case PbrMapKind::Emissive: request.maps.emissive = texture.path; break;
+      case PbrMapKind::Specular:
+      case PbrMapKind::IndexOfRefraction:
+      case PbrMapKind::Thickness:
+      case PbrMapKind::Translucency:
+      case PbrMapKind::Packed:
+        break;
+    }
+  }
+  request.geometry = geometry;
+  request.model = std::move(model);
+  request.output.width = 1024;
+  request.output.height = 1024;
+  return request;
+}
+
 }  // namespace
+
+class ScrubbableVideoWidget final : public QVideoWidget {
+ public:
+  using QVideoWidget::QVideoWidget;
+
+  void setPlayer(QMediaPlayer* player) { player_ = player; }
+
+ protected:
+  void mousePressEvent(QMouseEvent* event) override {
+    if (event->button() == Qt::LeftButton && player_ && player_->duration() > 0) {
+      dragging_ = true;
+      dragStartX_ = event->position().x();
+      dragStartPositionMs_ = player_->position();
+      setCursor(Qt::SizeHorCursor);
+    }
+    QVideoWidget::mousePressEvent(event);
+  }
+
+  void mouseMoveEvent(QMouseEvent* event) override {
+    if (dragging_ && player_) {
+      const auto deltaX = event->position().x() - dragStartX_;
+      const auto msPerPixel = (event->modifiers() & Qt::AltModifier) ? 60.0 : 300.0;
+      const auto target = dragStartPositionMs_ + static_cast<qint64>(deltaX * msPerPixel);
+      player_->setPosition(std::clamp<qint64>(target, 0, player_->duration()));
+    }
+    QVideoWidget::mouseMoveEvent(event);
+  }
+
+  void mouseReleaseEvent(QMouseEvent* event) override {
+    dragging_ = false;
+    setCursor(Qt::ArrowCursor);
+    QVideoWidget::mouseReleaseEvent(event);
+  }
+
+ private:
+  QMediaPlayer* player_{};
+  bool dragging_{};
+  qreal dragStartX_{};
+  qint64 dragStartPositionMs_{};
+};
 
 class DraggablePreviewLabel final : public QLabel {
  public:
@@ -317,6 +489,15 @@ class ExplorerPane final : public QWidget {
     bindContextMenu(icons_);
     bindContextMenu(details_);
 
+    // QFileSystemModel populates a directory asynchronously the first time it is
+    // reached; jumping straight to a deep, never-visited path (e.g. Reveal in
+    // Explorer from search or Library results) can otherwise land on an invalid
+    // index and fall back to showing the model's true root (Computer/drives)
+    // until a second navigate() call finds it already cached. Re-apply the root
+    // index whenever any directory finishes loading so the first jump self-heals.
+    connect(model_, &QFileSystemModel::directoryLoaded, this,
+            [this](const QString&) { applyRootIndex(); });
+
     stack_ = new QStackedWidget;
     stack_->addWidget(icons_);
     stack_->addWidget(details_);
@@ -355,11 +536,20 @@ class ExplorerPane final : public QWidget {
       historyIndex_ = history_.size() - 1;
     }
     path_ = canonical;
-    const auto source = model_->index(canonical);
+    model_->setRootPath(canonical);
+    applyRootIndex();
+    if (onPathChanged) onPathChanged(path_);
+  }
+
+  // Returns false when the model has not finished indexing path_ yet; the
+  // directoryLoaded connection in the constructor retries this automatically.
+  bool applyRootIndex() {
+    const auto source = model_->index(path_);
+    if (!source.isValid()) return false;
     const auto root = proxy_->mapFromSource(source);
     icons_->setRootIndex(root);
     details_->setRootIndex(root);
-    if (onPathChanged) onPathChanged(path_);
+    return true;
   }
 
   void back() {
@@ -499,6 +689,9 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent), jobs_{} {
   std::filesystem::create_directories(databasePath.parent_path());
   catalog_ = std::make_unique<Catalog>(databasePath);
 
+  morphisClient_ = std::make_unique<MorphisPreviewClient>(this);
+  morphisClient_->setCacheRoot(cacheRoot_);
+
   tabs_ = new QTabWidget;
   tabs_->setTabsClosable(true);
   tabs_->setMovable(true);
@@ -574,6 +767,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent), jobs_{} {
   });
 
   restoreSession();
+  previewDock_->hide();  // superseded by the Library window's preview panel
   refreshBookmarks();
   for (const auto& session : catalog_->scanSessions()) {
     if (session.state == ScanSessionState::Running) {
@@ -741,6 +935,19 @@ void MainWindow::moveCatalogTo(const QString& directory) {
   qInfo().noquote() << "Catalog root" << normalized;
 }
 
+void MainWindow::chooseMorphisExecutable() {
+  const auto current = morphisClient_->executablePath();
+  const auto selected = QFileDialog::getOpenFileName(
+      this, "Choose morphis_studio.exe",
+      current.isEmpty() ? QDir::homePath() : QFileInfo(current).absolutePath(),
+      "Morphis Studio (morphis_studio.exe);;Executables (*.exe);;All files (*)");
+  if (selected.isEmpty()) return;
+  morphisClient_->setExecutablePath(selected);
+  QMessageBox::information(this, "Morphis configured",
+                           "Atlas will use this Morphis executable for material previews:\n\n" +
+                               QDir::toNativeSeparators(selected));
+}
+
 BrowserTab* MainWindow::currentTab() const {
   return dynamic_cast<BrowserTab*>(tabs_->currentWidget());
 }
@@ -873,6 +1080,12 @@ void MainWindow::createMenusAndToolbars() {
   });
   connect(settingsMenu->addAction("Reset library folder to system default"),
           &QAction::triggered, this, &MainWindow::resetCatalogFolder);
+
+  settingsMenu->addSeparator();
+  auto* chooseMorphis = settingsMenu->addAction("Choose Morphis executable...");
+  chooseMorphis->setToolTip(
+      "Point Atlas at morphis_studio.exe so PBR materials can be rendered/previewed in Morphis");
+  connect(chooseMorphis, &QAction::triggered, this, &MainWindow::chooseMorphisExecutable);
 
   auto* help = menuBar()->addMenu("Help");
   connect(help->addAction("Quick start"), &QAction::triggered, this, [this] {
@@ -1103,6 +1316,7 @@ void MainWindow::createDocks() {
   auto* resumeScan = new QPushButton("Resume selected");
   auto* saveScanAs = new QPushButton("Save scan as…");
   auto* viewScan = new QPushButton("View organized results");
+  auto* openLibrary = new QPushButton("Open Library");
   scanControls->addWidget(scanFolder);
   scanControls->addWidget(scanDrive);
   scanControls->addStretch();
@@ -1110,6 +1324,7 @@ void MainWindow::createDocks() {
   scanControls->addWidget(resumeScan);
   scanControls->addWidget(saveScanAs);
   scanControls->addWidget(viewScan);
+  scanControls->addWidget(openLibrary);
   scansLayout->addWidget(scansView_, 1);
   scansLayout->addLayout(scanControls);
   connect(scanFolder, &QPushButton::clicked, this, [this] {
@@ -1123,6 +1338,7 @@ void MainWindow::createDocks() {
   connect(resumeScan, &QPushButton::clicked, this, &MainWindow::resumeSelectedScan);
   connect(saveScanAs, &QPushButton::clicked, this, &MainWindow::saveSelectedScanAs);
   connect(viewScan, &QPushButton::clicked, this, &MainWindow::showSelectedScanResults);
+  connect(openLibrary, &QPushButton::clicked, this, &MainWindow::showSelectedLibrary);
   connect(scansView_, &QTreeWidget::itemDoubleClicked, this,
           [this](QTreeWidgetItem*, int) { showSelectedScanResults(); });
   scansDock_->setWidget(scansContainer);
@@ -1265,17 +1481,15 @@ void MainWindow::saveSession() {
 void MainWindow::applyDefaultLayout() {
   foldersDock_->show();
   bookmarksDock_->show();
-  previewDock_->show();
+  previewDock_->hide();  // superseded by the Library window's preview panel
   jobsDock_->show();
   scansDock_->show();
   addDockWidget(Qt::LeftDockWidgetArea, foldersDock_);
   addDockWidget(Qt::LeftDockWidgetArea, bookmarksDock_);
   splitDockWidget(foldersDock_, bookmarksDock_, Qt::Vertical);
-  addDockWidget(Qt::RightDockWidgetArea, previewDock_);
   addDockWidget(Qt::BottomDockWidgetArea, jobsDock_);
   addDockWidget(Qt::BottomDockWidgetArea, scansDock_);
   tabifyDockWidget(jobsDock_, scansDock_);
-  resizeDocks({foldersDock_, previewDock_}, {280, 340}, Qt::Horizontal);
   resizeDocks({foldersDock_, bookmarksDock_}, {560, 260}, Qt::Vertical);
   resizeDocks({jobsDock_}, {280}, Qt::Vertical);
 }
@@ -1598,6 +1812,542 @@ void MainWindow::showSelectedScanResults() {
   const auto* item = scansView_ ? scansView_->currentItem() : nullptr;
   if (!item) return;
   showOrganizedScan(item->data(0, Qt::UserRole).toLongLong());
+}
+
+void MainWindow::showSelectedLibrary() {
+  const auto* item = scansView_ ? scansView_->currentItem() : nullptr;
+  if (!item) return;
+  showLibrary(item->data(0, Qt::UserRole).toLongLong());
+}
+
+void MainWindow::showLibrary(std::int64_t sessionId) {
+  const auto session = catalog_->scanSession(sessionId);
+  if (!session) return;
+
+  catalog_->organizeMaterials(sessionId);
+  const auto persistedMaterials = catalog_->materials(sessionId);
+
+  auto items = std::make_shared<std::vector<LibraryItem>>();
+  QSet<QString> usedTexturePaths;
+  for (const auto& material : persistedMaterials) {
+    LibraryItem entry;
+    entry.name = QString::fromStdString(material.name);
+    entry.path = QString::fromStdWString(material.directory.wstring());
+    entry.category = LibraryCategory::Material;
+    entry.materialId = material.id;
+    entry.workflow = material.workflow;
+    std::error_code error;
+    entry.modifiedMs = QDateTime::fromSecsSinceEpoch(0).toMSecsSinceEpoch();
+    const auto folderTime = std::filesystem::last_write_time(material.directory, error);
+    if (!error) {
+      entry.modifiedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::clock_cast<std::chrono::system_clock>(folderTime)
+                                  .time_since_epoch())
+                              .count();
+    }
+    std::uintmax_t totalBytes{};
+    QSet<QString> roles;
+    for (const auto& texture : material.textures) {
+      usedTexturePaths.insert(
+          QString::fromStdWString(texture.path.wstring()).toLower());
+      roles.insert(QString::fromUtf8(pbrMapKindName(texture.kind)));
+      const auto fileBytes = std::filesystem::file_size(texture.path, error);
+      if (!error) totalBytes += fileBytes;
+      error.clear();
+      if (entry.previewImagePath.isEmpty() || texture.kind == PbrMapKind::BaseColor) {
+        entry.previewImagePath = QString::fromStdWString(texture.path.wstring());
+      }
+    }
+    entry.sizeBytes = static_cast<qint64>(totalBytes);
+    entry.materialRoles = roles.values();
+    entry.materialRoles.sort(Qt::CaseInsensitive);
+    for (const auto& model : material.models) {
+      entry.linkedModels.append(
+          QString::fromStdWString(model.path.filename().wstring()));
+    }
+    entry.sourceMaterial = std::make_shared<CatalogMaterial>(material);
+    items->push_back(std::move(entry));
+  }
+
+  constexpr std::size_t generalLimit = 40000;
+  for (const auto& asset : catalog_->scanAssets(sessionId, generalLimit)) {
+    if (asset.metadata.isDirectory) continue;
+    const auto kind = classifyAsset(asset.metadata.path);
+    if (kind == AssetKind::Image &&
+        usedTexturePaths.contains(
+            QString::fromStdWString(asset.metadata.path.wstring()).toLower())) {
+      continue;
+    }
+    LibraryItem entry;
+    entry.name = QString::fromStdWString(asset.metadata.path.filename().wstring());
+    entry.path = QString::fromStdWString(asset.metadata.path.wstring());
+    entry.category = libraryCategoryFor(kind);
+    entry.sizeBytes = static_cast<qint64>(asset.metadata.sizeBytes);
+    entry.modifiedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            asset.metadata.modifiedAt.time_since_epoch())
+                            .count();
+    if (kind == AssetKind::Image) entry.previewImagePath = entry.path;
+    items->push_back(std::move(entry));
+  }
+
+  auto* dialog = new QDialog(this);
+  dialog->setAttribute(Qt::WA_DeleteOnClose);
+  dialog->setWindowTitle("Atlas Library - " +
+                         QDir::toNativeSeparators(QString::fromStdWString(session->root.wstring())));
+  dialog->resize(1440, 880);
+  auto* rootLayout = new QVBoxLayout(dialog);
+
+  auto* toolbar = new QHBoxLayout;
+  auto* search = new QLineEdit;
+  search->setPlaceholderText("Search this library…");
+  auto* viewMode = new QComboBox;
+  viewMode->addItem("Thumbnails");
+  viewMode->addItem("List");
+  auto* sortBy = new QComboBox;
+  sortBy->addItem("Name");
+  sortBy->addItem("Date modified");
+  sortBy->addItem("Size");
+  auto* groupByType = new QCheckBox("Group by type");
+  groupByType->setChecked(true);
+  auto* hideTypes = new QToolButton;
+  hideTypes->setText("Hide types ▾");
+  hideTypes->setPopupMode(QToolButton::InstantPopup);
+  auto* hideMenu = new QMenu(hideTypes);
+  auto hiddenCategories = std::make_shared<QSet<int>>();
+  for (const auto category : libraryCategories) {
+    auto* action = hideMenu->addAction(libraryCategoryLabel(category));
+    action->setCheckable(true);
+    action->setData(static_cast<int>(category));
+  }
+  hideTypes->setMenu(hideMenu);
+  toolbar->addWidget(search, 1);
+  toolbar->addWidget(new QLabel("View:"));
+  toolbar->addWidget(viewMode);
+  toolbar->addWidget(new QLabel("Sort:"));
+  toolbar->addWidget(sortBy);
+  toolbar->addWidget(groupByType);
+  toolbar->addWidget(hideTypes);
+  rootLayout->addLayout(toolbar);
+
+  auto* summary = new QLabel(QString("%1 materials  ·  %2 other assets shown  ·  %3 total")
+                                 .arg(persistedMaterials.size())
+                                 .arg(items->size() - persistedMaterials.size())
+                                 .arg(QLocale{}.toString(static_cast<qint64>(session->files))));
+  summary->setStyleSheet("color: #9aa4b2;");
+  rootLayout->addWidget(summary);
+
+  auto* splitter = new QSplitter(Qt::Horizontal);
+  rootLayout->addWidget(splitter, 1);
+
+  auto* sidebar = new QListWidget;
+  sidebar->setMaximumWidth(220);
+  auto addSidebarEntry = [&](const QString& label, int categoryValue) {
+    auto* entry = new QListWidgetItem(label, sidebar);
+    entry->setData(Qt::UserRole, categoryValue);
+  };
+  addSidebarEntry("All types", -1);
+  for (const auto category : libraryCategories) {
+    const auto count = std::count_if(items->begin(), items->end(),
+        [category](const LibraryItem& item) { return item.category == category; });
+    addSidebarEntry(QString("%1 (%2)").arg(libraryCategoryLabel(category)).arg(count),
+                    static_cast<int>(category));
+  }
+  sidebar->setCurrentRow(0);
+  splitter->addWidget(sidebar);
+
+  auto* centerArea = new QScrollArea;
+  centerArea->setWidgetResizable(true);
+  auto* centerContent = new QWidget;
+  auto* centerLayout = new QVBoxLayout(centerContent);
+  centerLayout->setContentsMargins(4, 4, 4, 4);
+  centerArea->setWidget(centerContent);
+  splitter->addWidget(centerArea);
+
+  auto* detailPanel = new QWidget;
+  detailPanel->setMinimumWidth(460);
+  detailPanel->setMaximumWidth(640);
+  auto* detailLayout = new QVBoxLayout(detailPanel);
+  auto* previewImage = new QLabel("Select an asset");
+  previewImage->setAlignment(Qt::AlignCenter);
+  previewImage->setMinimumHeight(420);
+  previewImage->setStyleSheet("background: #111318; border: 1px solid #303640; border-radius: 4px;");
+  auto* videoWidget = new ScrubbableVideoWidget;
+  videoWidget->setMinimumHeight(420);
+  videoWidget->setToolTip("Drag left/right to scrub · hold Alt to scrub slower");
+  videoWidget->hide();
+  auto* mediaPlayer = new QMediaPlayer(detailPanel);
+  auto* audioOutput = new QAudioOutput(detailPanel);
+  mediaPlayer->setAudioOutput(audioOutput);
+  mediaPlayer->setVideoOutput(videoWidget);
+  videoWidget->setPlayer(mediaPlayer);
+  auto* detailTitle = new QLabel;
+  detailTitle->setStyleSheet("font-weight: 600; font-size: 11pt;");
+  detailTitle->setWordWrap(true);
+  auto* detailInfo = new QLabel;
+  detailInfo->setWordWrap(true);
+  detailInfo->setStyleSheet("color: #9aa4b2;");
+  auto* revealButton = new QPushButton("Reveal in Explorer");
+  revealButton->setEnabled(false);
+  auto* previewGeometry = new QComboBox;
+  previewGeometry->setToolTip(
+      "Choose Morphis preview geometry. Linked models discovered with this material appear here.");
+  auto* morphisRow = new QHBoxLayout;
+  auto* renderPreviewButton = new QPushButton("Render preview");
+  auto* openInMorphisButton = new QPushButton("Open in Morphis");
+  renderPreviewButton->setEnabled(false);
+  openInMorphisButton->setEnabled(false);
+  morphisRow->addWidget(renderPreviewButton);
+  morphisRow->addWidget(openInMorphisButton);
+  auto* morphisStatus = new QLabel;
+  morphisStatus->setWordWrap(true);
+  morphisStatus->setStyleSheet("color: #9aa4b2;");
+  detailLayout->addWidget(previewImage);
+  detailLayout->addWidget(videoWidget);
+  detailLayout->addWidget(detailTitle);
+  detailLayout->addWidget(detailInfo, 1);
+  detailLayout->addWidget(previewGeometry);
+  detailLayout->addLayout(morphisRow);
+  detailLayout->addWidget(morphisStatus);
+  detailLayout->addWidget(revealButton);
+  splitter->addWidget(detailPanel);
+  splitter->setStretchFactor(1, 1);
+
+  auto thumbnailCache = std::make_shared<ThumbnailCache>(cacheRoot_);
+  auto revealPath = std::make_shared<QString>();
+  auto selectedItem = std::make_shared<const LibraryItem*>(nullptr);
+  auto pendingRequestId = std::make_shared<QString>();
+  auto pendingItem = std::make_shared<const LibraryItem*>(nullptr);
+
+  const auto populatePreviewGeometry = [previewGeometry](const LibraryItem& item) {
+    const QSignalBlocker blocker(previewGeometry);
+    previewGeometry->clear();
+    const auto addPrimitive = [previewGeometry](const QString& name,
+                                                MorphisPreviewGeometry geometry) {
+      previewGeometry->addItem(name, static_cast<int>(geometry));
+    };
+    addPrimitive("Preview on sphere", MorphisPreviewGeometry::Sphere);
+    addPrimitive("Preview on plane", MorphisPreviewGeometry::Plane);
+    addPrimitive("Preview on cube", MorphisPreviewGeometry::Cube);
+    addPrimitive("Preview on cylinder", MorphisPreviewGeometry::Cylinder);
+    if (item.sourceMaterial) {
+      for (const auto& model : item.sourceMaterial->models) {
+        const auto path = QString::fromStdWString(model.path.wstring());
+        // Morphis 0.23's public Atlas-preview runtime currently guarantees
+        // imported-model rendering for UV-bearing Wavefront OBJ files.
+        if (QFileInfo(path).suffix().compare("obj", Qt::CaseInsensitive) != 0) continue;
+        previewGeometry->addItem(
+            "Preview on linked model: " + QFileInfo(path).fileName(),
+            static_cast<int>(MorphisPreviewGeometry::Model));
+        previewGeometry->setItemData(previewGeometry->count() - 1, path, Qt::UserRole + 1);
+      }
+    }
+    previewGeometry->setEnabled(item.category == LibraryCategory::Material);
+  };
+
+  const auto morphisConfigured = morphisClient_->isConfigured();
+  const QString morphisTooltip = morphisConfigured
+      ? QString{}
+      : "Configure Morphis in Settings > Choose Morphis executable first";
+  renderPreviewButton->setToolTip(morphisTooltip);
+  openInMorphisButton->setToolTip(morphisTooltip);
+
+  auto selectItem = [this, previewImage, videoWidget, mediaPlayer, detailTitle, detailInfo,
+                     revealButton, thumbnailCache, revealPath, selectedItem, renderPreviewButton,
+                     openInMorphisButton, morphisStatus, morphisConfigured,
+                     populatePreviewGeometry](const LibraryItem& item) {
+    *selectedItem = &item;
+    mediaPlayer->stop();
+    mediaPlayer->setSource({});
+    videoWidget->hide();
+    previewImage->show();
+    previewImage->setPixmap({});
+    previewImage->setText("Loading…");
+    morphisStatus->setText({});
+    const bool isMaterial = item.category == LibraryCategory::Material && item.sourceMaterial;
+    populatePreviewGeometry(item);
+    renderPreviewButton->setEnabled(isMaterial && morphisConfigured);
+    openInMorphisButton->setEnabled(isMaterial && morphisConfigured);
+    *revealPath = item.category == LibraryCategory::Material
+                     ? item.path
+                     : QFileInfo(item.path).absolutePath();
+    revealButton->setEnabled(true);
+
+    detailTitle->setText(item.name);
+    QStringList lines;
+    lines << libraryCategoryLabel(item.category);
+    if (item.sizeBytes > 0) lines << QLocale{}.formattedDataSize(item.sizeBytes);
+    if (item.modifiedMs > 0) {
+      lines << QDateTime::fromMSecsSinceEpoch(item.modifiedMs).toString("yyyy-MM-dd HH:mm");
+    }
+    if (item.category == LibraryCategory::Material) {
+      lines << QString("Status: %1").arg(QString::fromUtf8(pbrWorkflowName(item.workflow)));
+      if (!item.materialRoles.isEmpty()) {
+        lines << QString("Maps: %1").arg(item.materialRoles.join(", "));
+      }
+      lines << (item.linkedModels.isEmpty()
+                    ? QString("Linked 3D models: none found in this folder")
+                    : QString("Linked 3D models: %1").arg(item.linkedModels.join(", ")));
+    } else {
+      lines << QDir::toNativeSeparators(item.path);
+    }
+    detailInfo->setText(lines.join('\n'));
+
+    if (item.category == LibraryCategory::Video) {
+      previewImage->hide();
+      videoWidget->show();
+      mediaPlayer->setSource(QUrl::fromLocalFile(item.path));
+      mediaPlayer->play();
+      return;
+    }
+    if (item.category == LibraryCategory::Audio) {
+      previewImage->setText("♫ " + item.name);
+      mediaPlayer->setSource(QUrl::fromLocalFile(item.path));
+      mediaPlayer->play();
+      return;
+    }
+    if (item.previewImagePath.isEmpty()) {
+      previewImage->setPixmap(libraryCategoryIcon(item.category).pixmap(160, 160));
+      previewImage->setText({});
+      return;
+    }
+    const auto sourcePath = item.previewImagePath;
+    const auto size = previewImage->size();
+    jobs_.submit("Library preview", [thumbnailCache, sourcePath, size, previewImage](
+                                        std::stop_token token, const JobReporter&) {
+      if (token.stop_requested()) return;
+      const auto image = thumbnailCache->load(sourcePath, size);
+      QMetaObject::invokeMethod(previewImage, [previewImage, image] {
+        if (image.isNull()) {
+          previewImage->setText("Preview unavailable");
+          previewImage->setPixmap({});
+          return;
+        }
+        previewImage->setText({});
+        previewImage->setPixmap(
+            QPixmap::fromImage(image).scaled(previewImage->size(), Qt::KeepAspectRatio,
+                                             Qt::SmoothTransformation));
+      }, Qt::QueuedConnection);
+    });
+  };
+
+  connect(revealButton, &QPushButton::clicked, dialog, [this, revealPath] {
+    if (!revealPath->isEmpty() && currentTab()) currentTab()->activePane()->navigate(*revealPath);
+  });
+
+  connect(renderPreviewButton, &QPushButton::clicked, dialog,
+          [this, selectedItem, pendingRequestId, pendingItem, morphisStatus, previewGeometry] {
+    if (!*selectedItem || !(*selectedItem)->sourceMaterial) return;
+    const auto* item = *selectedItem;
+    morphisStatus->setText("Rendering in Morphis…");
+    *pendingItem = item;
+    const auto geometry = static_cast<MorphisPreviewGeometry>(previewGeometry->currentData().toInt());
+    std::optional<std::filesystem::path> model;
+    const auto modelPath = previewGeometry->currentData(Qt::UserRole + 1).toString();
+    if (!modelPath.isEmpty()) model = std::filesystem::path(modelPath.toStdWString());
+    *pendingRequestId = morphisClient_->requestHeadlessRender(
+        buildMorphisPreviewRequest(*item->sourceMaterial, geometry, std::move(model)));
+  });
+  connect(openInMorphisButton, &QPushButton::clicked, dialog,
+          [this, selectedItem, morphisStatus, previewGeometry] {
+    if (!*selectedItem || !(*selectedItem)->sourceMaterial) return;
+    morphisStatus->setText("Opened in Morphis.");
+    const auto geometry = static_cast<MorphisPreviewGeometry>(previewGeometry->currentData().toInt());
+    std::optional<std::filesystem::path> model;
+    const auto modelPath = previewGeometry->currentData(Qt::UserRole + 1).toString();
+    if (!modelPath.isEmpty()) model = std::filesystem::path(modelPath.toStdWString());
+    morphisClient_->openInteractive(buildMorphisPreviewRequest(
+        *(*selectedItem)->sourceMaterial, geometry, std::move(model)));
+  });
+  connect(morphisClient_.get(), &MorphisPreviewClient::renderReady, dialog,
+          [pendingRequestId, pendingItem, selectedItem, previewImage, videoWidget, morphisStatus](
+              QString requestId, QString imagePath, QString renderer, bool fromCache) {
+    if (requestId != *pendingRequestId || *pendingItem != *selectedItem) return;
+    videoWidget->hide();
+    previewImage->show();
+    previewImage->setText({});
+    previewImage->setPixmap(QPixmap(imagePath).scaled(
+        previewImage->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
+    morphisStatus->setText(
+        QString("Rendered with %1%2.").arg(renderer, fromCache ? " (cached)" : ""));
+  });
+  connect(morphisClient_.get(), &MorphisPreviewClient::renderFailed, dialog,
+          [pendingRequestId, pendingItem, selectedItem, morphisStatus](QString requestId,
+                                                                       QString error) {
+    if (requestId != *pendingRequestId || *pendingItem != *selectedItem) return;
+    morphisStatus->setText("Morphis render failed: " + error);
+  });
+
+  auto rebuild = std::make_shared<std::function<void()>>();
+  auto grids = std::make_shared<std::vector<QWidget*>>();
+
+  *rebuild = [=, this]() mutable {
+    QLayoutItem* child{};
+    while ((child = centerLayout->takeAt(0)) != nullptr) {
+      delete child->widget();
+      delete child;
+    }
+    grids->clear();
+
+    const auto selectedSidebarRow = sidebar->currentRow();
+    const auto selectedCategory = selectedSidebarRow > 0
+                                      ? static_cast<int>(libraryCategories[selectedSidebarRow - 1])
+                                      : -1;
+    const auto query = search->text().trimmed();
+    const bool listMode = viewMode->currentIndex() == 1;
+    const int sortKey = sortBy->currentIndex();
+
+    std::vector<const LibraryItem*> visible;
+    for (const auto& item : *items) {
+      if (hiddenCategories->contains(static_cast<int>(item.category))) continue;
+      if (selectedCategory >= 0 && static_cast<int>(item.category) != selectedCategory) continue;
+      if (!query.isEmpty() && !item.name.contains(query, Qt::CaseInsensitive)) continue;
+      visible.push_back(&item);
+    }
+    const auto sorter = [sortKey](const LibraryItem* left, const LibraryItem* right) {
+      switch (sortKey) {
+        case 1: return left->modifiedMs > right->modifiedMs;
+        case 2: return left->sizeBytes > right->sizeBytes;
+        default: return QString::compare(left->name, right->name, Qt::CaseInsensitive) < 0;
+      }
+    };
+
+    auto navigateToItem = [this](const LibraryItem* item) {
+      if (!item || !currentTab()) return;
+      const auto target = item->category == LibraryCategory::Material
+                              ? item->path
+                              : QFileInfo(item->path).absolutePath();
+      currentTab()->activePane()->navigate(target);
+    };
+
+    auto shortLocation = [](const LibraryItem* item) {
+      const auto directory = item->category == LibraryCategory::Material
+                                 ? QDir::toNativeSeparators(item->path)
+                                 : QDir::toNativeSeparators(QFileInfo(item->path).absolutePath());
+      const auto parts = directory.split(QDir::separator(), Qt::SkipEmptyParts);
+      if (parts.size() <= 2) return directory;
+      return QString("…%1%2%3%4").arg(QDir::separator())
+          .arg(parts[parts.size() - 2]).arg(QDir::separator()).arg(parts.last());
+    };
+
+    auto buildGrid = [&](const std::vector<const LibraryItem*>& groupItems,
+                         bool capHeight) -> QWidget* {
+      if (listMode) {
+        auto* tree = new QTreeWidget;
+        tree->setColumnCount(4);
+        tree->setHeaderLabels({"Name", "Size", "Modified", "Location"});
+        tree->setRootIsDecorated(false);
+        tree->setAlternatingRowColors(true);
+        tree->setSelectionMode(QAbstractItemView::SingleSelection);
+        tree->header()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+        tree->header()->setSectionResizeMode(3, QHeaderView::Stretch);
+        tree->setFrameShape(QFrame::NoFrame);
+        for (const auto* item : groupItems) {
+          const auto sizeText = item->sizeBytes > 0
+                                    ? QLocale{}.formattedDataSize(item->sizeBytes)
+                                    : QString{};
+          const auto dateText = item->modifiedMs > 0
+                                    ? QDateTime::fromMSecsSinceEpoch(item->modifiedMs)
+                                          .toString("yyyy-MM-dd HH:mm")
+                                    : QString{};
+          const auto locationText = item->category == LibraryCategory::Material
+                                        ? QDir::toNativeSeparators(item->path)
+                                        : QDir::toNativeSeparators(
+                                              QFileInfo(item->path).absolutePath());
+          auto* row = new QTreeWidgetItem(
+              tree, {item->name, sizeText, dateText, locationText});
+          row->setIcon(0, libraryCategoryIcon(item->category));
+          row->setToolTip(3, locationText);
+          row->setData(0, Qt::UserRole, QVariant::fromValue(reinterpret_cast<quintptr>(item)));
+        }
+        connect(tree, &QTreeWidget::currentItemChanged, dialog,
+                [selectItem](QTreeWidgetItem* current, QTreeWidgetItem*) {
+          if (!current) return;
+          const auto* item = reinterpret_cast<const LibraryItem*>(
+              current->data(0, Qt::UserRole).value<quintptr>());
+          if (item) selectItem(*item);
+        });
+        connect(tree, &QTreeWidget::itemDoubleClicked, dialog,
+                [navigateToItem](QTreeWidgetItem* clicked, int) {
+          navigateToItem(reinterpret_cast<const LibraryItem*>(
+              clicked->data(0, Qt::UserRole).value<quintptr>()));
+        });
+        tree->setMaximumHeight(capHeight ? 300 : 16777215);
+        grids->push_back(tree);
+        return tree;
+      }
+
+      auto* grid = new QListWidget;
+      grid->setViewMode(QListView::IconMode);
+      grid->setResizeMode(QListView::Adjust);
+      grid->setMovement(QListView::Static);
+      grid->setSelectionMode(QAbstractItemView::SingleSelection);
+      grid->setWordWrap(true);
+      grid->setIconSize({104, 104});
+      grid->setGridSize({156, 184});
+      grid->setSpacing(6);
+      grid->setUniformItemSizes(false);
+      grid->setFrameShape(QFrame::NoFrame);
+      for (const auto* item : groupItems) {
+        auto* widgetItem = new QListWidgetItem(
+            libraryCategoryIcon(item->category),
+            item->name + "\n" + shortLocation(item), grid);
+        widgetItem->setToolTip(item->name + "\n" + QDir::toNativeSeparators(item->path));
+        widgetItem->setData(Qt::UserRole, QVariant::fromValue(reinterpret_cast<quintptr>(item)));
+      }
+      grid->setMaximumHeight(capHeight ? 340 : 16777215);
+      connect(grid, &QListWidget::currentItemChanged, dialog,
+              [selectItem](QListWidgetItem* current, QListWidgetItem*) {
+        if (!current) return;
+        const auto* item = reinterpret_cast<const LibraryItem*>(
+            current->data(Qt::UserRole).value<quintptr>());
+        if (item) selectItem(*item);
+      });
+      connect(grid, &QListWidget::itemDoubleClicked, dialog,
+              [navigateToItem](QListWidgetItem* clicked) {
+        navigateToItem(reinterpret_cast<const LibraryItem*>(
+            clicked->data(Qt::UserRole).value<quintptr>()));
+      });
+      grids->push_back(grid);
+      return grid;
+    };
+
+    if (groupByType->isChecked() && selectedCategory < 0) {
+      for (const auto category : libraryCategories) {
+        if (hiddenCategories->contains(static_cast<int>(category))) continue;
+        std::vector<const LibraryItem*> groupItems;
+        for (const auto* item : visible) {
+          if (item->category == category) groupItems.push_back(item);
+        }
+        if (groupItems.empty()) continue;
+        std::sort(groupItems.begin(), groupItems.end(), sorter);
+        auto* header = new QLabel(QString("%1 (%2)")
+                                       .arg(libraryCategoryLabel(category))
+                                       .arg(groupItems.size()));
+        header->setStyleSheet("font-weight: 600; padding-top: 6px;");
+        centerLayout->addWidget(header);
+        centerLayout->addWidget(buildGrid(groupItems, true));
+      }
+    } else {
+      std::sort(visible.begin(), visible.end(), sorter);
+      centerLayout->addWidget(buildGrid(visible, false), 1);
+    }
+    centerLayout->addStretch();
+  };
+
+  connect(search, &QLineEdit::textChanged, dialog, [rebuild] { (*rebuild)(); });
+  connect(viewMode, &QComboBox::currentIndexChanged, dialog, [rebuild] { (*rebuild)(); });
+  connect(sortBy, &QComboBox::currentIndexChanged, dialog, [rebuild] { (*rebuild)(); });
+  connect(groupByType, &QCheckBox::toggled, dialog, [rebuild] { (*rebuild)(); });
+  connect(sidebar, &QListWidget::currentRowChanged, dialog, [rebuild] { (*rebuild)(); });
+  connect(hideMenu, &QMenu::triggered, dialog, [hiddenCategories, rebuild](QAction* action) {
+    const auto category = action->data().toInt();
+    if (action->isChecked()) hiddenCategories->insert(category);
+    else hiddenCategories->remove(category);
+    (*rebuild)();
+  });
+
+  (*rebuild)();
+  dialog->show();
 }
 
 void MainWindow::showOrganizedScan(std::int64_t sessionId) {

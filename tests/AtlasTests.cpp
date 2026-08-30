@@ -1,5 +1,6 @@
 #include <AtlasDatabase/Catalog.h>
 #include <AtlasCore/FileOperations.h>
+#include <AtlasCore/MorphisPreview.h>
 #include <AtlasCore/PbrMaterial.h>
 #include <AtlasCore/StorageAnalyzer.h>
 #include <AtlasJobs/JobQueue.h>
@@ -451,6 +452,66 @@ void organizeMaterialsLinksModelsByNameAndByProximity() {
           "sole model in a single-material folder was not linked by proximity");
 }
 
+void morphisPreviewMapsWorkflowToV1Keys() {
+  require(std::string(atlas::morphisPreviewMapKey(atlas::PbrMapKind::BaseColor)) == "baseColor",
+          "base color did not map to the v1 baseColor key");
+  require(std::string(atlas::morphisPreviewMapKey(atlas::PbrMapKind::Glossiness)) == "glossiness",
+          "glossiness was not preserved as its own declared map (must not fold into roughness)");
+  require(std::string(atlas::morphisPreviewMapKey(atlas::PbrMapKind::AmbientOcclusion)) ==
+              "ambientOcclusion",
+          "ambient occlusion did not map to the v1 ambientOcclusion key");
+  require(atlas::morphisPreviewMapKey(atlas::PbrMapKind::Specular) == nullptr,
+          "specular has no v1 slot and must not silently map to another role");
+  require(atlas::morphisPreviewMapKey(atlas::PbrMapKind::Packed) == nullptr,
+          "packed maps have no v1 slot yet and must not silently map to another role");
+}
+
+void morphisPreviewRequestSerializesToV1Schema() {
+  atlas::MorphisPreviewRequest request;
+  request.requestId = "atlas-material-42";
+  request.materialName = "Alien Metal";
+  request.workflow = atlas::PbrWorkflow::MetalRoughness;
+  request.maps.baseColor = std::filesystem::path("D:/Assets/Alien/alien_basecolor.png");
+  request.maps.normal = std::filesystem::path("D:/Assets/Alien/alien_normalgl.png");
+  request.parameters.specularIor = 1.62;
+  request.parameters.specularLevel = 0.85;
+  request.parameters.anisotropy = 0.4;
+  request.parameters.coatWeight = 0.25;
+  request.parameters.sheenWeight = 0.15;
+  request.geometry = atlas::MorphisPreviewGeometry::Sphere;
+  request.output.image = std::filesystem::path("C:/AtlasCache/renders/42.png");
+  request.output.result = std::filesystem::path("C:/AtlasCache/renders/42.result.json");
+
+  const auto json = atlas::serializeMorphisPreviewRequest(request);
+  require(json.find("\"schema\":\"morphis.atlas-preview/1\"") != std::string::npos,
+          "serialized request is missing the v1 schema tag");
+  require(json.find("\"requestId\":\"atlas-material-42\"") != std::string::npos,
+          "serialized request is missing its request id");
+  require(json.find("\"workflow\":\"metal-roughness\"") != std::string::npos,
+          "serialized request did not encode the PBR workflow name");
+  require(json.find("\"baseColor\":\"D:/Assets/Alien/alien_basecolor.png\"") != std::string::npos,
+          "serialized request did not write an absolute forward-slash map path");
+  require(json.find("\"specularIor\":1.62") != std::string::npos &&
+              json.find("\"specularLevel\":0.85") != std::string::npos &&
+              json.find("\"anisotropy\":0.4") != std::string::npos &&
+              json.find("\"coatWeight\":0.25") != std::string::npos &&
+              json.find("\"sheenWeight\":0.15") != std::string::npos,
+          "serialized request omitted Morphis production-PBR parameters");
+  require(json.find("\"geometry\":\"sphere\"") != std::string::npos,
+          "serialized request did not encode preview geometry");
+  require(json.find("\"image\":\"C:/AtlasCache/renders/42.png\"") != std::string::npos,
+          "serialized request did not encode the output image path");
+  require(json.find("\"glossiness\"") == std::string::npos,
+          "an unset optional map must be omitted rather than written as null");
+
+  request.geometry = atlas::MorphisPreviewGeometry::Model;
+  request.model = std::filesystem::path("D:/Assets/Alien/alien.obj");
+  const auto modelJson = atlas::serializeMorphisPreviewRequest(request);
+  require(modelJson.find("\"geometry\":\"model\"") != std::string::npos &&
+              modelJson.find("\"model\":\"D:/Assets/Alien/alien.obj\"") != std::string::npos,
+          "serialized request did not preserve linked-model preview geometry");
+}
+
 }  // namespace
 
 int main() {
@@ -470,6 +531,8 @@ int main() {
     storageAnalysisFindsPbrMaterialsAndFormats();
     pbrNamesGroupCollectionFoldersConservatively();
     organizeMaterialsLinksModelsByNameAndByProximity();
+    morphisPreviewMapsWorkflowToV1Keys();
+    morphisPreviewRequestSerializesToV1Schema();
     std::cout << "All Atlas foundation tests passed\n";
     return 0;
   } catch (const std::exception& error) {

@@ -30,6 +30,26 @@ int main(int argc, char* argv[]) {
   QApplication::setApplicationVersion("0.1.0");
   qInstallMessageHandler(logMessage);
   application.setStyle(QStyleFactory::create("Fusion"));
+  // Fusion falls back to the platform accent color for palette roles the stylesheet
+  // below doesn't cover (e.g. alternating list/tree row backgrounds), which reads as
+  // a jarring stray color on any system with a saturated Windows accent. Pin an
+  // explicit dark palette so Atlas looks the same regardless of the user's accent.
+  QPalette darkPalette;
+  darkPalette.setColor(QPalette::Window, QColor(0x17, 0x19, 0x1d));
+  darkPalette.setColor(QPalette::WindowText, QColor(0xe7, 0xe9, 0xed));
+  darkPalette.setColor(QPalette::Base, QColor(0x11, 0x13, 0x18));
+  darkPalette.setColor(QPalette::AlternateBase, QColor(0x1b, 0x1e, 0x24));
+  darkPalette.setColor(QPalette::ToolTipBase, QColor(0x23, 0x27, 0x2e));
+  darkPalette.setColor(QPalette::ToolTipText, QColor(0xe7, 0xe9, 0xed));
+  darkPalette.setColor(QPalette::Text, QColor(0xe7, 0xe9, 0xed));
+  darkPalette.setColor(QPalette::Button, QColor(0x28, 0x2d, 0x35));
+  darkPalette.setColor(QPalette::ButtonText, QColor(0xe7, 0xe9, 0xed));
+  darkPalette.setColor(QPalette::BrightText, Qt::red);
+  darkPalette.setColor(QPalette::Highlight, QColor(0x31, 0x5f, 0x91));
+  darkPalette.setColor(QPalette::HighlightedText, Qt::white);
+  darkPalette.setColor(QPalette::Disabled, QPalette::Text, QColor(0x6b, 0x72, 0x7c));
+  darkPalette.setColor(QPalette::Disabled, QPalette::WindowText, QColor(0x6b, 0x72, 0x7c));
+  application.setPalette(darkPalette);
   application.setStyleSheet(R"css(
     QWidget { background: #17191d; color: #e7e9ed; font-size: 10pt; }
     QMainWindow::separator { background: #2b3038; width: 4px; height: 4px; }

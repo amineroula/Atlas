@@ -21,7 +21,7 @@ add_subdirectory(src/AtlasJobs)
 
 option(ATLAS_BUILD_DESKTOP "Build the Qt desktop application" ON)
 if(ATLAS_BUILD_DESKTOP)
-  find_package(Qt6 6.5 COMPONENTS Core Gui Widgets QUIET)
+  find_package(Qt6 6.5 COMPONENTS Core Gui Widgets Multimedia MultimediaWidgets QUIET)
   if(Qt6_FOUND)
     add_subdirectory(src/AtlasUI)
   else()

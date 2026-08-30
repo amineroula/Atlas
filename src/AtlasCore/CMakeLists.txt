@@ -1,6 +1,7 @@
 add_library(AtlasCore
   src/Asset.cpp
   src/FileOperations.cpp
+  src/MorphisPreview.cpp
   src/PbrMaterial.cpp
   src/StorageAnalyzer.cpp
 )
