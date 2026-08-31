@@ -3,6 +3,7 @@ add_library(AtlasCore
   src/FileOperations.cpp
   src/MorphisPreview.cpp
   src/PbrMaterial.cpp
+  src/QuixelAsset.cpp
   src/StorageAnalyzer.cpp
 )
 add_library(Atlas::Core ALIAS AtlasCore)

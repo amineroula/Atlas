@@ -2,6 +2,7 @@
 #include <AtlasCore/FileOperations.h>
 #include <AtlasCore/MorphisPreview.h>
 #include <AtlasCore/PbrMaterial.h>
+#include <AtlasCore/QuixelAsset.h>
 #include <AtlasCore/StorageAnalyzer.h>
 #include <AtlasJobs/JobQueue.h>
 #include <AtlasScanner/Scanner.h>
@@ -512,6 +513,73 @@ void morphisPreviewRequestSerializesToV1Schema() {
           "serialized request did not preserve linked-model preview geometry");
 }
 
+void quixelFoldersBecomeSingleTypedAssets() {
+  TemporaryDirectory temporary;
+  const auto assetDirectory = temporary.path() / "3d" / "nature_rock_uk4pehu";
+  std::filesystem::create_directories(assetDirectory / "Thumbs" / "1k");
+  const auto metadata = assetDirectory / "uk4pehu.json";
+  std::ofstream(metadata)
+      << R"({"name":"Desert Western Cluster Rock Medium 06","categories":["3d","rock"],)"
+         R"("tags":["desert","stone"],"id":"uk4pehu"})";
+  const std::vector<std::filesystem::path> paths{
+      metadata,
+      assetDirectory / "uk4pehu_4K_Albedo.jpg",
+      assetDirectory / "uk4pehu_4K_Normal_LOD0.jpg",
+      assetDirectory / "uk4pehu_4K_Roughness.jpg",
+      assetDirectory / "uk4pehu_LOD0.fbx",
+      assetDirectory / "uk4pehu_LOD1.fbx",
+      assetDirectory / "uk4pehu_Preview.png",
+      assetDirectory / "Thumbs" / "1k" / "uk4pehu_1K_Albedo.jpg"};
+  const auto plantDirectory = temporary.path() / "3dplant" / "crop_wild_vdfpcgbia";
+  const auto plantMetadata = plantDirectory / "vdfpcgbia.json";
+  const std::vector<std::filesystem::path> plantPaths{
+      plantMetadata,
+      plantDirectory / "vdfpcgbia_Preview.png",
+      plantDirectory / "Textures" / "Atlas" / "vdfpcgbia_8K_Albedo.jpg",
+      plantDirectory / "Var1" / "vdfpcgbia_Var1_LOD0.fbx",
+      plantDirectory / "Var1" / "vdfpcgbia_Var1_LOD1.fbx"};
+  std::filesystem::create_directories(plantDirectory / "Textures" / "Atlas");
+  std::filesystem::create_directories(plantDirectory / "Var1");
+  std::ofstream(plantMetadata)
+      << R"({"name":"Wild Crop","categories":["3dplant"],"tags":["plant"],)"
+         R"("id":"vdfpcgbia"})";
+  for (const auto& path : paths) {
+    if (path == metadata) continue;
+    std::ofstream(path) << "fixture";
+  }
+  for (const auto& path : plantPaths) {
+    if (path == plantMetadata) continue;
+    std::ofstream(path) << "fixture";
+  }
+
+  auto allPaths = paths;
+  allPaths.insert(allPaths.end(), plantPaths.begin(), plantPaths.end());
+  const auto assets = atlas::organizeQuixelAssets(allPaths, temporary.path());
+  require(assets.size() == 2, "Quixel folders were not grouped into typed assets");
+  const auto model = std::find_if(assets.begin(), assets.end(), [](const auto& candidate) {
+    return candidate.id == "uk4pehu";
+  });
+  require(model != assets.end(), "Quixel model asset was not found");
+  const auto& asset = *model;
+  require(asset.id == "uk4pehu" && asset.name == "Desert Western Cluster Rock Medium 06",
+          "Quixel metadata identity was not read");
+  require(asset.kind == atlas::QuixelAssetKind::Model,
+          "Quixel 3d category was not recognized");
+  require(asset.meshes.size() == 2 && asset.meshes[0].lod == 0 && asset.meshes[1].lod == 1,
+          "Quixel FBX LODs were not retained");
+  require(asset.textures.size() == 3,
+          "Quixel source maps were not separated from its thumbnail pyramid");
+  require(asset.previewPath.filename() == "uk4pehu_Preview.png",
+          "Quixel asset preview was not selected");
+  const auto plant = std::find_if(assets.begin(), assets.end(), [](const auto& candidate) {
+    return candidate.id == "vdfpcgbia";
+  });
+  require(plant != assets.end() && plant->kind == atlas::QuixelAssetKind::Plant,
+          "Quixel 3D plant was not recognized");
+  require(plant->meshes.size() == 2 && plant->textures.size() == 1,
+          "Nested Quixel plant variants and textures were not assigned to their owning asset");
+}
+
 }  // namespace
 
 int main() {
@@ -531,6 +599,7 @@ int main() {
     storageAnalysisFindsPbrMaterialsAndFormats();
     pbrNamesGroupCollectionFoldersConservatively();
     organizeMaterialsLinksModelsByNameAndByProximity();
+    quixelFoldersBecomeSingleTypedAssets();
     morphisPreviewMapsWorkflowToV1Keys();
     morphisPreviewRequestSerializesToV1Schema();
     std::cout << "All Atlas foundation tests passed\n";

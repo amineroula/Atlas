@@ -1,4 +1,5 @@
 #include "MainWindow.h"
+#include "AtlasLibraryManifest.h"
 #include "MorphisPreviewClient.h"
 #include "ThumbnailCache.h"
 
@@ -6,6 +7,7 @@
 #include <AtlasCore/FileOperations.h>
 #include <AtlasCore/MorphisPreview.h>
 #include <AtlasCore/PbrMaterial.h>
+#include <AtlasCore/QuixelAsset.h>
 #include <AtlasCore/StorageAnalyzer.h>
 #include <AtlasDatabase/Catalog.h>
 #include <AtlasScanner/Scanner.h>
@@ -122,6 +124,7 @@ struct LibraryItem {
   QStringList linkedModels;
   QString previewImagePath;
   std::shared_ptr<CatalogMaterial> sourceMaterial;
+  std::shared_ptr<QuixelAsset> sourceQuixel;
 };
 
 QString libraryCategoryLabel(LibraryCategory category) {
@@ -1870,8 +1873,57 @@ void MainWindow::showLibrary(std::int64_t sessionId) {
   }
 
   constexpr std::size_t generalLimit = 40000;
-  for (const auto& asset : catalog_->scanAssets(sessionId, generalLimit)) {
+  const auto scannedAssets = catalog_->scanAssets(sessionId, generalLimit);
+  std::vector<std::filesystem::path> scannedPaths;
+  scannedPaths.reserve(scannedAssets.size());
+  for (const auto& asset : scannedAssets) {
+    if (!asset.metadata.isDirectory) scannedPaths.push_back(asset.metadata.path);
+  }
+  const auto quixelAssets = organizeQuixelAssets(scannedPaths, session->root);
+  QString manifestError;
+  if (!writeAtlasLibraryManifest(persistedMaterials, quixelAssets, &manifestError)) {
+    qWarning().noquote() << "Could not publish Atlas library manifest:" << manifestError;
+  }
+  QStringList groupedQuixelDirectories;
+  for (const auto& quixel : quixelAssets) {
+    if (quixel.kind != QuixelAssetKind::Model && quixel.kind != QuixelAssetKind::Plant) continue;
+    LibraryItem entry;
+    entry.name = QString::fromStdString(quixel.name);
+    entry.path = QString::fromStdWString(quixel.directory.wstring());
+    entry.category = LibraryCategory::Model;
+    entry.previewImagePath = QString::fromStdWString(quixel.previewPath.wstring());
+    std::error_code error;
+    std::uintmax_t totalBytes{};
+    for (const auto& mesh : quixel.meshes) {
+      const auto bytes = std::filesystem::file_size(mesh.path, error);
+      if (!error) totalBytes += bytes;
+      error.clear();
+    }
+    for (const auto& texture : quixel.textures) {
+      const auto bytes = std::filesystem::file_size(texture.path, error);
+      if (!error) totalBytes += bytes;
+      error.clear();
+    }
+    entry.sizeBytes = static_cast<qint64>(totalBytes);
+    entry.sourceQuixel = std::make_shared<QuixelAsset>(quixel);
+    groupedQuixelDirectories.append(
+        QDir::fromNativeSeparators(QDir::cleanPath(entry.path)).toLower() + "/");
+    items->push_back(std::move(entry));
+  }
+
+  for (const auto& asset : scannedAssets) {
     if (asset.metadata.isDirectory) continue;
+    const auto normalizedPath = QDir::fromNativeSeparators(QDir::cleanPath(
+        QString::fromStdWString(asset.metadata.path.wstring()))).toLower();
+    const bool groupedQuixelFile = std::any_of(
+        groupedQuixelDirectories.cbegin(), groupedQuixelDirectories.cend(),
+        [&normalizedPath](const QString& directory) {
+          return normalizedPath.startsWith(directory);
+        });
+    if (groupedQuixelFile) continue;
+    if (normalizedPath.contains("/thumbs/") || normalizedPath.contains("/previews/")) {
+      continue;
+    }
     const auto kind = classifyAsset(asset.metadata.path);
     if (kind == AssetKind::Image &&
         usedTexturePaths.contains(
@@ -2067,7 +2119,7 @@ void MainWindow::showLibrary(std::int64_t sessionId) {
     populatePreviewGeometry(item);
     renderPreviewButton->setEnabled(isMaterial && morphisConfigured);
     openInMorphisButton->setEnabled(isMaterial && morphisConfigured);
-    *revealPath = item.category == LibraryCategory::Material
+    *revealPath = item.category == LibraryCategory::Material || item.sourceQuixel
                      ? item.path
                      : QFileInfo(item.path).absolutePath();
     revealButton->setEnabled(true);
@@ -2087,6 +2139,19 @@ void MainWindow::showLibrary(std::int64_t sessionId) {
       lines << (item.linkedModels.isEmpty()
                     ? QString("Linked 3D models: none found in this folder")
                     : QString("Linked 3D models: %1").arg(item.linkedModels.join(", ")));
+    } else if (item.sourceQuixel) {
+      lines << "Source: Quixel Megascans";
+      lines << QString("Quixel ID: %1").arg(QString::fromStdString(item.sourceQuixel->id));
+      lines << QString("Type: %1").arg(
+          QString::fromUtf8(quixelAssetKindName(item.sourceQuixel->kind)));
+      lines << QString("Meshes / LODs: %1").arg(item.sourceQuixel->meshes.size());
+      lines << QString("Texture maps: %1").arg(item.sourceQuixel->textures.size());
+      if (!item.sourceQuixel->tags.empty()) {
+        QStringList tags;
+        for (const auto& tag : item.sourceQuixel->tags) tags << QString::fromStdString(tag);
+        lines << QString("Tags: %1").arg(tags.join(", "));
+      }
+      lines << QDir::toNativeSeparators(item.path);
     } else {
       lines << QDir::toNativeSeparators(item.path);
     }
@@ -2213,14 +2278,14 @@ void MainWindow::showLibrary(std::int64_t sessionId) {
 
     auto navigateToItem = [this](const LibraryItem* item) {
       if (!item || !currentTab()) return;
-      const auto target = item->category == LibraryCategory::Material
+      const auto target = item->category == LibraryCategory::Material || item->sourceQuixel
                               ? item->path
                               : QFileInfo(item->path).absolutePath();
       currentTab()->activePane()->navigate(target);
     };
 
     auto shortLocation = [](const LibraryItem* item) {
-      const auto directory = item->category == LibraryCategory::Material
+      const auto directory = item->category == LibraryCategory::Material || item->sourceQuixel
                                  ? QDir::toNativeSeparators(item->path)
                                  : QDir::toNativeSeparators(QFileInfo(item->path).absolutePath());
       const auto parts = directory.split(QDir::separator(), Qt::SkipEmptyParts);
