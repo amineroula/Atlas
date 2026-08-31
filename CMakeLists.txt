@@ -1,0 +1,43 @@
+cmake_minimum_required(VERSION 3.24)
+project(MorphisAtlas VERSION 0.1.0 LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+if(MSVC)
+  add_compile_options(/W4 /permissive-)
+else()
+  add_compile_options(-Wall -Wextra -Wpedantic)
+endif()
+
+include(CTest)
+find_package(SQLite3 REQUIRED)
+
+add_subdirectory(src/AtlasCore)
+add_subdirectory(src/AtlasDatabase)
+add_subdirectory(src/AtlasScanner)
+add_subdirectory(src/AtlasJobs)
+
+option(ATLAS_BUILD_DESKTOP "Build the Qt desktop application" ON)
+if(ATLAS_BUILD_DESKTOP)
+  find_package(Qt6 6.5 COMPONENTS Core Gui Widgets Multimedia MultimediaWidgets QUIET)
+  if(Qt6_FOUND)
+    add_subdirectory(src/AtlasUI)
+  else()
+    message(WARNING "Qt 6.5+ was not found; the Atlas desktop target will not be built")
+  endif()
+endif()
+
+if(BUILD_TESTING)
+  add_subdirectory(tests)
+endif()
+
+set(CPACK_PACKAGE_NAME "Morphis Atlas")
+set(CPACK_PACKAGE_VENDOR "Morphis")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Digital asset operating system for creative workflows")
+set(CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
+set(CPACK_PACKAGE_INSTALL_DIRECTORY "Morphis Atlas")
+set(CPACK_NSIS_DISPLAY_NAME "Morphis Atlas")
+set(CPACK_NSIS_PACKAGE_NAME "Morphis Atlas")
+include(CPack)
