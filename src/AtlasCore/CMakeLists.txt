@@ -1,5 +1,7 @@
 add_library(AtlasCore
   src/Asset.cpp
+  src/AssetCatalogModel.cpp
+  src/FabIngestService.cpp
   src/FileOperations.cpp
   src/MorphisPreview.cpp
   src/PbrMaterial.cpp
